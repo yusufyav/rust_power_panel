@@ -1,0 +1,10 @@
+# Rust derleme klasörleri
+/target/
+
+# Cargo lock dosyası (isteğe bağlı)
+/Cargo.lock
+
+# Geçici sistem dosyaları
+*.swp
+*.tmp
+*.log
