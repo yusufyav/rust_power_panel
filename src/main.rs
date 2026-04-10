@@ -1,7 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{
-    glib, Application, ApplicationWindow, Box as GtkBox, Label, Orientation, CssProvider,
-};
+use gtk4::{glib, Application, ApplicationWindow, Box as GtkBox, CssProvider, Label, Orientation};
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use nvml_wrapper::Nvml;
 use std::sync::{Arc, Mutex};
@@ -16,8 +14,8 @@ struct SensorData {
     cpu_watt: f32,
     gpu_temp: u32,
     gpu_watt: f32,
-    gpu_dec:  u32,
-    gpu_enc:  u32,
+    gpu_dec: u32,
+    gpu_enc: u32,
 }
 
 fn main() -> glib::ExitCode {
@@ -42,7 +40,8 @@ fn build_ui(app: &Application) {
     window.set_margin(Edge::Right, 20);
 
     let css = CssProvider::new();
-    css.load_from_data("
+    css.load_from_data(
+        "
         window { background-color: transparent; }
         .panel {
             background-color: rgba(10, 10, 10, 0.97);
@@ -105,7 +104,8 @@ fn build_ui(app: &Application) {
             min-height: 1px;
             margin: 4px 0px;
         }
-    ");
+    ",
+    );
 
     gtk4::style_context_add_provider_for_display(
         &gtk4::gdk::Display::default().unwrap(),
@@ -165,7 +165,9 @@ fn build_ui(app: &Application) {
                     let lbl = c.label().to_lowercase();
                     if lbl.contains("cpu") || lbl.contains("k10") || lbl.contains("composite") {
                         let t = c.temperature();
-                        if t > cpu_temp { cpu_temp = t; }
+                        if t > cpu_temp {
+                            cpu_temp = t;
+                        }
                     }
                 }
 
@@ -178,15 +180,17 @@ fn build_ui(app: &Application) {
 
                 let mut gpu_watt = 0.0f32;
                 let mut gpu_temp = 0u32;
-                let mut gpu_dec  = 0u32;
-                let mut gpu_enc  = 0u32;
+                let mut gpu_dec = 0u32;
+                let mut gpu_enc = 0u32;
 
                 if let Some(ref n) = nvml {
                     if let Ok(dev) = n.device_by_index(0) {
                         gpu_watt = dev.power_usage().unwrap_or(0) as f32 / 1000.0;
-                        gpu_temp = dev.temperature(
-                            nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu
-                        ).unwrap_or(0);
+                        gpu_temp = dev
+                            .temperature(
+                                nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu,
+                            )
+                            .unwrap_or(0);
 
                         if let Ok(info) = dev.decoder_utilization() {
                             gpu_dec = info.utilization;
@@ -202,8 +206,8 @@ fn build_ui(app: &Application) {
                     d.cpu_watt = cpu_watt;
                     d.gpu_temp = gpu_temp;
                     d.gpu_watt = gpu_watt;
-                    d.gpu_dec  = gpu_dec;
-                    d.gpu_enc  = gpu_enc;
+                    d.gpu_dec = gpu_dec;
+                    d.gpu_enc = gpu_enc;
                 }
 
                 tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -276,15 +280,51 @@ fn make_util_row(label_text: &str, label_class: &str) -> (GtkBox, Label) {
     (row, val_lbl)
 }
 
+/// Sistemdeki tüm olası RAPL enerji yollarını sırayla dener,
+/// okunabilen ilk geçerli yoldan CPU güç tüketimini hesaplar.
+/// Watt = ΔEnerji(µJ) / ΔZaman(s) / 1_000_000
 fn read_rapl_watts() -> Option<f32> {
     use std::fs;
     use std::time::Instant;
 
-    let path = "/sys/class/powercap/amd-energy-pkg/energy_uj";
-    let e1: u64 = fs::read_to_string(path).ok()?.trim().parse().ok()?;
-    let t1 = Instant::now();
-    std::thread::sleep(Duration::from_millis(100));
-    let e2: u64 = fs::read_to_string(path).ok()?.trim().parse().ok()?;
-    let dt = t1.elapsed().as_secs_f32();
-    Some((e2.saturating_sub(e1)) as f32 / dt / 1_000_000.0)
+    // Öncelik sırasıyla denenecek yollar:
+    // - intel-rapl:0  → AMD Ryzen dahil pek çok sistemde çalışır (ACPI RAPL arayüzü)
+    // - intel-rapl/intel-rapl:0 → bazı dağıtımlarda farklı mount noktası
+    // - amd-energy-pkg → eski AMD amd_energy sürücüsü
+    // - amd_energy/energy1_input → bazı Ryzen sistemlerinde
+    let candidates = [
+        "/sys/class/powercap/intel-rapl:0/energy_uj",
+        "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj",
+        "/sys/class/powercap/amd-energy-pkg/energy_uj",
+        "/sys/class/powercap/amd_energy/energy1_input",
+    ];
+
+    for path in &candidates {
+        let Ok(s1) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(e1) = s1.trim().parse::<u64>() else {
+            continue;
+        };
+
+        let t1 = Instant::now();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let Ok(s2) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(e2) = s2.trim().parse::<u64>() else {
+            continue;
+        };
+
+        let dt = t1.elapsed().as_secs_f32();
+        let watts = (e2.saturating_sub(e1)) as f32 / dt / 1_000_000.0;
+
+        // Makul aralık kontrolü: 1W-400W arası geçerli kabul et
+        if watts > 1.0 && watts < 400.0 {
+            return Some(watts);
+        }
+    }
+
+    None
 }
