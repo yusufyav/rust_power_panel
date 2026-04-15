@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug (Linux)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/rust_power_panel",
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo build (linux)",
+            "linux": {}
+        }
+    ]
+}
