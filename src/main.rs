@@ -14,8 +14,7 @@ const APP_ID: &str = "com.rustpanel.powerpanel";
 
 #[derive(Debug, Default, Clone)]
 struct AmdDecInfo {
-    dec_procs: Vec<(String, u32)>,
-    enc_procs: Vec<(String, u32)>,
+    media_procs: Vec<(String, u32, u32)>,
 }
 
 struct FdInfoTracker {
@@ -65,11 +64,11 @@ impl FdInfoTracker {
                     if line.starts_with("drm-client-id:") {
                         client_id = Some(Self::parse_ns(line));
                     } else if line.starts_with("drm-engine-dec:") {
-                        fd_dec += Self::parse_ns(line);
+                        fd_dec = fd_dec.max(Self::parse_ns(line));
                     } else if line.starts_with("drm-engine-enc:") {
-                        fd_enc += Self::parse_ns(line);
+                        fd_enc = fd_enc.max(Self::parse_ns(line));
                     } else if line.starts_with("drm-engine-capacity-dec:") {
-                        cap_dec = Self::parse_ns(line) as u32; 
+                        cap_dec = Self::parse_ns(line) as u32;
                     } else if line.starts_with("drm-engine-capacity-enc:") {
                         cap_enc = Self::parse_ns(line) as u32;
                     }
@@ -89,8 +88,7 @@ impl FdInfoTracker {
             }
         }
 
-        let mut dec_list: Vec<(String, u32)> = Vec::new();
-        let mut enc_list: Vec<(String, u32)> = Vec::new();
+        let mut media_list: Vec<(String, u32, u32)> = Vec::new();
 
         for (cid, (name, dec_ns, enc_ns, cap_dec, cap_enc)) in &current {
             if let Some(&(prev_dec, prev_enc, prev_t)) = self.prev.get(cid) {
@@ -103,8 +101,9 @@ impl FdInfoTracker {
                 let dec_p = (((dec_d as f64 / elapsed as f64) * 100.0) as u32) / cap_dec;
                 let enc_p = (((enc_d as f64 / elapsed as f64) * 100.0) as u32) / cap_enc;
 
-                if dec_p > 0 { dec_list.push((name.clone(), dec_p)); }
-                if enc_p > 0 { enc_list.push((name.clone(), enc_p)); }
+                if dec_p > 0 || enc_p > 0 { 
+                    media_list.push((name.clone(), dec_p, enc_p)); 
+                }
             }
         }
 
@@ -113,12 +112,10 @@ impl FdInfoTracker {
             self.prev.insert(*cid, (*dec_ns, *enc_ns, now));
         }
 
-        dec_list.sort_by(|a, b| b.1.cmp(&a.1));
-        enc_list.sort_by(|a, b| b.1.cmp(&a.1));
+        media_list.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
 
         AmdDecInfo {
-            dec_procs: dec_list,
-            enc_procs: enc_list,
+            media_procs: media_list,
         }
     }
 
@@ -133,7 +130,7 @@ impl FdInfoTracker {
 // ── GPU backend ───────────────────────────────────────────────────────────────
 
 enum GpuBackend {
-    Nvidia(Nvml),
+    Nvidia(Box<Nvml>), // Nvml'i Box içine aldık
     Amd { hwmon_path: String, pdev: String, vcn_instances: u32 },
     None,
 }
@@ -146,9 +143,7 @@ struct SensorData {
     cpu_watt:     f32,
     gpu_temp:     f32,
     gpu_watt:     f32,
-    // Artık tek bir String değil, tüm uygulamaları ve yüzdelerini liste halinde tutuyoruz
-    dec_procs:    Vec<(String, u32)>, 
-    enc_procs:    Vec<(String, u32)>,
+    media_procs:  Vec<(String, u32, u32)>, 
     gpu_kind:     GpuKind,
 }
 
@@ -188,6 +183,7 @@ fn build_ui(app: &Application) {
     window.set_keyboard_mode(KeyboardMode::None);
 
     let css = CssProvider::new();
+    // Nerd Font garantisi için font-family listesine eklendi
     css.load_from_data("
         window { background-color: transparent; }
         .panel {
@@ -197,35 +193,35 @@ fn build_ui(app: &Application) {
             padding: 18px 24px;
         }
         .total-watt {
-            color: #00ffcc; font-family: 'JetBrains Mono', monospace;
+            color: #00ffcc; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 26px; font-weight: bold;
         }
         .lbl-cpu {
-            color: #ff9f43; font-family: 'JetBrains Mono', monospace;
+            color: #ff9f43; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 16px; font-weight: bold;
         }
         .lbl-gpu {
-            color: #2ecc71; font-family: 'JetBrains Mono', monospace;
+            color: #2ecc71; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 16px; font-weight: bold;
         }
         .lbl-util {
-            color: #a29bfe; font-family: 'JetBrains Mono', monospace;
+            color: #a29bfe; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 16px; font-weight: bold;
         }
         .val-watt {
-            color: #ffffff; font-family: 'JetBrains Mono', monospace;
+            color: #ffffff; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 16px;
         }
         .val-temp {
-            color: #ff4757; font-family: 'JetBrains Mono', monospace;
+            color: #ff4757; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 16px;
         }
         .val-proc {
-            color: #b2bec3; font-family: 'JetBrains Mono', monospace;
+            color: #b2bec3; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 13px;
         }
         .val-pct {
-            color: #dfe6e9; font-family: 'JetBrains Mono', monospace;
+            color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 16px;
         }
         .divider {
@@ -248,21 +244,21 @@ fn build_ui(app: &Application) {
     total_label.set_halign(gtk4::Align::Center);
     panel.append(&total_label);
 
-    let (cpu_row, cpu_watt_lbl, cpu_temp_lbl) = make_hw_row("⚙", "CPU", "lbl-cpu");
+    // Fastfetch İkonları Eklendi (CPU ve GPU)
+    let (cpu_row, cpu_watt_lbl, cpu_temp_lbl) = make_hw_row("", "CPU", "lbl-cpu");
     panel.append(&cpu_row);
 
-    let (gpu_row, gpu_watt_lbl, gpu_temp_lbl) = make_hw_row("▣", "GPU", "lbl-gpu");
+    let (gpu_row, gpu_watt_lbl, gpu_temp_lbl) = make_hw_row("󰢮", "GPU", "lbl-gpu");
     panel.append(&gpu_row);
 
     let sep = gtk4::Separator::new(Orientation::Horizontal);
     sep.add_css_class("divider");
+    sep.set_visible(false); 
     panel.append(&sep);
 
-    let (dec_row, dec_proc_lbl, dec_pct_lbl) = make_codec_row("◈", "DEC");
-    panel.append(&dec_row);
-
-    let (enc_row, enc_proc_lbl, enc_pct_lbl) = make_codec_row("◉", "ENC");
-    panel.append(&enc_row);
+    let (media_container, media_proc_lbl, media_dec_lbl, media_enc_lbl) = make_media_section();
+    media_container.set_visible(false); 
+    panel.append(&media_container);
 
     window.set_child(Some(&panel));
 
@@ -343,8 +339,7 @@ fn build_ui(app: &Application) {
 
                 let mut gpu_temp = 0.0f32;
                 let mut gpu_watt = 0.0f32;
-                let mut dec_procs = Vec::new();
-                let mut enc_procs = Vec::new();
+                let mut media_procs = Vec::new();
                 let mut gpu_kind = GpuKind::Unknown;
 
                 match &gpu_backend {
@@ -359,21 +354,26 @@ fn build_ui(app: &Application) {
                             let total_dec = dev.decoder_utilization().map(|u| u.utilization).unwrap_or(0);
                             let total_enc = dev.encoder_utilization().map(|u| u.utilization).unwrap_or(0);
 
-                            // Nvidia için de tüm uygulamaları listeye çeviriyoruz
                             if total_dec > 0 || total_enc > 0 {
                                 sys.refresh_processes(ProcessesToUpdate::All, false);
+                                let mut proc_map: HashMap<u32, (u32, u32)> = HashMap::new();
                                 if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
                                     for s in samples {
-                                        let mut name = String::new();
-                                        if let Some(proc) = sys.process(sysinfo::Pid::from(s.pid as usize)) {
-                                            name = proc.name().to_string_lossy().into_owned();
-                                        }
-                                        if s.dec_util > 0 { dec_procs.push((name.clone(), s.dec_util)); }
-                                        if s.enc_util > 0 { enc_procs.push((name.clone(), s.enc_util)); }
+                                        let e = proc_map.entry(s.pid).or_insert((0, 0));
+                                        if s.dec_util > 0 { e.0 = s.dec_util; }
+                                        if s.enc_util > 0 { e.1 = s.enc_util; }
                                     }
                                 }
-                                dec_procs.sort_by(|a, b| b.1.cmp(&a.1));
-                                enc_procs.sort_by(|a, b| b.1.cmp(&a.1));
+                                for (pid, (dec, enc)) in proc_map {
+                                    if dec > 0 || enc > 0 {
+                                        let mut name = String::new();
+                                        if let Some(proc) = sys.process(sysinfo::Pid::from(pid as usize)) {
+                                            name = proc.name().to_string_lossy().into_owned();
+                                        }
+                                        media_procs.push((name, dec, enc));
+                                    }
+                                }
+                                media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
                             }
                         }
                     }
@@ -393,8 +393,7 @@ fn build_ui(app: &Application) {
 
                         if let Some(ref mut tracker) = fdinfo_tracker {
                             let info = tracker.sample();
-                            dec_procs = info.dec_procs;
-                            enc_procs = info.enc_procs;
+                            media_procs = info.media_procs;
                         }
                     }
 
@@ -402,13 +401,12 @@ fn build_ui(app: &Application) {
                 }
 
                 if let Ok(mut d) = data_writer.lock() {
-                    d.cpu_temp  = cpu_temp;
-                    d.cpu_watt  = cpu_watt;
-                    d.gpu_temp  = gpu_temp;
-                    d.gpu_watt  = gpu_watt;
-                    d.dec_procs = dec_procs;
-                    d.enc_procs = enc_procs;
-                    d.gpu_kind  = gpu_kind;
+                    d.cpu_temp    = cpu_temp;
+                    d.cpu_watt    = cpu_watt;
+                    d.gpu_temp    = gpu_temp;
+                    d.gpu_watt    = gpu_watt;
+                    d.media_procs = media_procs;
+                    d.gpu_kind    = gpu_kind;
                 }
 
                 tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -419,37 +417,28 @@ fn build_ui(app: &Application) {
     glib::timeout_add_local(Duration::from_millis(1000), move || {
         if let Ok(d) = data.lock() {
             total_label.set_text(&format!("⚡ {:>6.1} W", d.cpu_watt + d.gpu_watt));
+            
             cpu_watt_lbl.set_text(&format!("{:>6.1} W", d.cpu_watt));
             cpu_temp_lbl.set_text(&format!("{:>3.0} °C", d.cpu_temp.floor()));
             gpu_watt_lbl.set_text(&format!("{:>6.1} W", d.gpu_watt));
-            gpu_temp_lbl.set_text(&format!("{:>5.0} °C", d.gpu_temp.floor()));
+            gpu_temp_lbl.set_text(&format!("{:>3.0} °C", d.gpu_temp.floor()));
 
             let valid_gpu = d.gpu_kind != GpuKind::Unknown;
 
-            // Sadece çalışan DEC işlemi varsa satırı göster
-            if valid_gpu && !d.dec_procs.is_empty() {
-                dec_row.set_visible(true);
-                let procs_str = d.dec_procs.iter().map(|(n, _)| format!("[{}]", n)).collect::<Vec<_>>().join("\n");
-                let pct_str   = d.dec_procs.iter().map(|(_, p)| format!("{:>3} %", p)).collect::<Vec<_>>().join("\n");
-                dec_proc_lbl.set_text(&procs_str);
-                dec_pct_lbl.set_text(&pct_str);
+            if valid_gpu && !d.media_procs.is_empty() {
+                media_container.set_visible(true);
+                let procs_str = d.media_procs.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>().join("\n");
+                let dec_str   = d.media_procs.iter().map(|(_, dec, _)| format!("{:>3} %", dec)).collect::<Vec<_>>().join("\n");
+                let enc_str   = d.media_procs.iter().map(|(_, _, enc)| format!("{:>3} %", enc)).collect::<Vec<_>>().join("\n");
+                
+                media_proc_lbl.set_text(&procs_str);
+                media_dec_lbl.set_text(&dec_str);
+                media_enc_lbl.set_text(&enc_str);
             } else {
-                dec_row.set_visible(false);
+                media_container.set_visible(false);
             }
 
-            // Sadece çalışan ENC işlemi varsa satırı göster
-            if valid_gpu && !d.enc_procs.is_empty() {
-                enc_row.set_visible(true);
-                let procs_str = d.enc_procs.iter().map(|(n, _)| format!("[{}]", n)).collect::<Vec<_>>().join("\n");
-                let pct_str   = d.enc_procs.iter().map(|(_, p)| format!("{:>3} %", p)).collect::<Vec<_>>().join("\n");
-                enc_proc_lbl.set_text(&procs_str);
-                enc_pct_lbl.set_text(&pct_str);
-            } else {
-                enc_row.set_visible(false);
-            }
-
-            // DEC veya ENC'den en az biri aktifse aradaki ince çizgiyi göster, ikisi de yoksa çizgiyi gizle
-            sep.set_visible(valid_gpu && (!d.dec_procs.is_empty() || !d.enc_procs.is_empty()));
+            sep.set_visible(valid_gpu && !d.media_procs.is_empty());
         }
         glib::ControlFlow::Continue
     });
@@ -458,7 +447,7 @@ fn build_ui(app: &Application) {
 fn detect_gpu() -> GpuBackend {
     if let Ok(nvml) = Nvml::init() {
         if nvml.device_by_index(0).is_ok() {
-            return GpuBackend::Nvidia(nvml);
+            return GpuBackend::Nvidia(Box::new(nvml));
         }
     }
 
@@ -501,10 +490,9 @@ fn find_rapl_path() -> Option<&'static str> {
         "/sys/class/powercap/amd-energy-pkg/energy_uj",
         "/sys/class/powercap/amd_energy/energy1_input",
     ];
-    for &p in CANDIDATES {
-        if fs::metadata(p).is_ok() { return Some(p); }
-    }
-    None
+    
+    // For döngüsü yerine şık ve idomatik iteratör zinciri:
+    CANDIDATES.iter().copied().find(|&p| fs::metadata(p).is_ok())
 }
 
 fn read_u64(path: &str) -> Result<u64, std::io::Error> {
@@ -514,45 +502,55 @@ fn read_u64(path: &str) -> Result<u64, std::io::Error> {
 
 fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label) {
     let row = GtkBox::new(Orientation::Horizontal, 0);
+    
     let lbl_icon = Label::builder().label(icon).css_classes(vec![cls.to_string()])
         .width_chars(3).xalign(0.0).build();
+        
     let lbl_name = Label::builder().label(name).css_classes(vec![cls.to_string()])
-        .width_chars(4).xalign(0.0).build();
+        .hexpand(true).xalign(0.0).build();
+        
     let lbl_watt = Label::builder().label("   0.0 W")
         .css_classes(vec!["val-watt".to_string()])
         .width_chars(8).xalign(1.0).build();
-    let lbl_therm = Label::builder().label(" 🌡")
+        
+    // Fastfetch Termometre İkonu Eklendi
+    let lbl_therm = Label::builder().label(" ")
         .css_classes(vec!["val-temp".to_string()])
-        .width_chars(2).xalign(1.0).build();
+        .width_chars(3).xalign(1.0).build();
+        
     let lbl_temp = Label::builder().label("  0 °C")
         .css_classes(vec!["val-temp".to_string()])
-        .width_chars(7).xalign(1.0).build();
+        .width_chars(6).xalign(1.0).build();
+        
     row.append(&lbl_icon); row.append(&lbl_name); row.append(&lbl_watt);
     row.append(&lbl_therm); row.append(&lbl_temp);
     (row, lbl_watt, lbl_temp)
 }
 
-// Kritik dokunuş: Çok satırlı (multiline) yazıldığında ikonun ve isimlerin hep üstte (Start) kalması için
-// .valign(gtk4::Align::Start) parametresi eklendi. Böylece alt satıra inildiğinde ortalanma bozulmayacak.
-fn make_codec_row(icon: &str, name: &str) -> (GtkBox, Label, Label) {
-    let row = GtkBox::new(Orientation::Horizontal, 0);
-    let lbl_icon = Label::builder().label(icon)
-        .css_classes(vec!["lbl-util".to_string()])
-        .width_chars(3).xalign(0.0).valign(gtk4::Align::Start).build();
-    let lbl_name = Label::builder().label(name)
-        .css_classes(vec!["lbl-util".to_string()])
-        .width_chars(4).xalign(0.0).valign(gtk4::Align::Start).build();
+fn make_media_section() -> (GtkBox, Label, Label, Label) {
+    let container = GtkBox::new(Orientation::Vertical, 4);
+
+    let header_row = GtkBox::new(Orientation::Horizontal, 0);
+    let lbl_name = Label::builder().label("Name").css_classes(vec!["lbl-util".to_string()]).hexpand(true).xalign(0.0).build();
+    let lbl_dec_hdr = Label::builder().label("DEC").css_classes(vec!["lbl-util".to_string()]).width_chars(6).xalign(1.0).build();
+    let lbl_enc_hdr = Label::builder().label("ENC").css_classes(vec!["lbl-util".to_string()]).width_chars(6).xalign(1.0).build();
+    header_row.append(&lbl_name); header_row.append(&lbl_dec_hdr); header_row.append(&lbl_enc_hdr);
+
+    let data_row = GtkBox::new(Orientation::Horizontal, 0);
     
-    // .ellipsize kaldırıldı, artık metin sığmayınca taşacak veya alt alta eklenecek
-    let lbl_proc = Label::builder().label("")
-        .css_classes(vec!["val-proc".to_string()])
-        .hexpand(true).xalign(0.5).valign(gtk4::Align::Start).build();
+    let lbl_proc = Label::builder().css_classes(vec!["val-proc".to_string()])
+        .hexpand(true).xalign(0.0).valign(gtk4::Align::Start)
+        .max_width_chars(16).ellipsize(gtk4::pango::EllipsizeMode::End).build();
         
-    let lbl_pct = Label::builder().label("  0 %")
-        .css_classes(vec!["val-pct".to_string()])
+    let lbl_dec = Label::builder().css_classes(vec!["val-pct".to_string()])
+        .width_chars(6).xalign(1.0).valign(gtk4::Align::Start).build();
+    let lbl_enc = Label::builder().css_classes(vec!["val-pct".to_string()])
         .width_chars(6).xalign(1.0).valign(gtk4::Align::Start).build();
         
-    row.append(&lbl_icon); row.append(&lbl_name);
-    row.append(&lbl_proc); row.append(&lbl_pct);
-    (row, lbl_proc, lbl_pct)
+    data_row.append(&lbl_proc); data_row.append(&lbl_dec); data_row.append(&lbl_enc);
+
+    container.append(&header_row);
+    container.append(&data_row);
+
+    (container, lbl_proc, lbl_dec, lbl_enc)
 }
