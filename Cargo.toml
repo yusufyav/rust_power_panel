@@ -10,3 +10,10 @@ nvml-wrapper     = "0.12.1"
 tokio            = { version = "1.0", features = ["full"] }
 sysinfo          = "0.38"
 glib             = "0.20"
+
+[profile.release]
+opt-level = 3        # Maksimum hız optimizasyonu
+lto = true           # Link Time Optimization (Daha küçük ve hızlı binary)
+strip = true         # Sembolleri silerek dosya boyutunu %80 küçültür
+codegen-units = 1    # Derleme yavaşlar ama çalışma hızı artar
+panic = "abort"      # Hata anında doğrudan kapanarak belleği hızlı boşaltır
