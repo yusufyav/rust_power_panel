@@ -18,23 +18,32 @@ struct AmdDecInfo {
 }
 
 struct FdInfoTracker {
-    prev: HashMap<u64, (u64, u64, Instant)>,
+    prev: HashMap<u64, (i64, i64, i64, Instant)>, // dec_ns, enc_ns, jpeg_ns, time
     pdev: String,
-    vcn_instances: u32,
 }
 
 impl FdInfoTracker {
-    fn new(pdev: String, vcn_instances: u32) -> Self {
+    fn new(pdev: String) -> Self {
         Self {
             prev: HashMap::new(),
             pdev,
-            vcn_instances,
         }
     }
 
     fn sample(&mut self) -> AmdDecInfo {
         let now = Instant::now();
-        let mut current: HashMap<u64, (String, u64, u64, u32, u32)> = HashMap::new();
+
+        // amdgpu_top get_proc_usage() mantığı:
+        // Her process'in tüm fd'leri taranır.
+        // drm-client-id HashSet ile dedup: aynı cid ikinci fd'de ATLANIR.
+        // pid → (name, dec_ns, enc_ns, jpeg_ns, seen_cid_set)
+        // Sonra: total_dec = (dec + jpeg) / 2  (VCN3/Navi22 için)
+
+        // PID bazlı biriktirme — aynı isimden birden fazla process
+        // (örn. iki mpv) ayrı ayrı gösterilebilsin
+        let mut pid_map: HashMap<u32, (String, i64, i64, i64)> = HashMap::new();
+        // Bu örnekte görülen tüm drm-client-id'ler (global dedup)
+        let mut seen_cids: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         let Ok(proc_dir) = fs::read_dir("/proc") else {
             return AmdDecInfo::default();
@@ -43,125 +52,102 @@ impl FdInfoTracker {
         for entry in proc_dir.flatten() {
             let fname = entry.file_name();
             let pid_str = fname.to_string_lossy();
-            let Ok(pid) = pid_str.parse::<u32>() else {
-                continue;
-            };
+            let Ok(pid) = pid_str.parse::<u32>() else { continue; };
 
             let fd_path = format!("/proc/{}/fd", pid);
-            let Ok(fd_dir) = fs::read_dir(&fd_path) else {
-                continue;
-            };
+            let Ok(fd_dir) = fs::read_dir(&fd_path) else { continue; };
 
             let mut proc_name = String::new();
 
             for fd_entry in fd_dir.flatten() {
                 let fd_num = fd_entry.file_name();
                 let fdinfo_path = format!("/proc/{}/fdinfo/{}", pid, fd_num.to_string_lossy());
-                let Ok(content) = fs::read_to_string(&fdinfo_path) else {
-                    continue;
-                };
+                let Ok(content) = fs::read_to_string(&fdinfo_path) else { continue; };
 
-                if !content.contains("amdgpu") {
-                    continue;
-                }
-                if !self.pdev.is_empty() && !content.contains(&self.pdev) {
-                    continue;
-                }
+                if !content.contains("amdgpu") { continue; }
+                if !self.pdev.is_empty() && !content.contains(&self.pdev) { continue; }
 
-                let mut client_id = None;
-                let mut fd_dec: u64 = 0;
-                let mut fd_enc: u64 = 0;
-                let mut cap_dec: u32 = 0;
-                let mut cap_enc: u32 = 0;
+                // drm-client-id satırını bul — amdgpu_top gibi önce bu okunur
+                let mut client_id: Option<u64> = None;
+                let mut fd_dec: i64 = 0;
+                let mut fd_enc: i64 = 0;
+                let mut fd_jpeg: i64 = 0;
 
                 for line in content.lines() {
                     if line.starts_with("drm-client-id:") {
-                        client_id = Some(Self::parse_ns(line));
+                        client_id = line.split_whitespace()
+                            .nth(1).and_then(|v| v.parse().ok());
                     } else if line.starts_with("drm-engine-dec:") {
-                        fd_dec = fd_dec.max(Self::parse_ns(line));
+                        // Aynı fdinfo içinde birden fazla satır → TOPLA (amdgpu_top gibi)
+                        fd_dec += line.split_whitespace()
+                            .nth(1).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
                     } else if line.starts_with("drm-engine-enc:") {
-                        fd_enc = fd_enc.max(Self::parse_ns(line));
-                    } else if line.starts_with("drm-engine-capacity-dec:") {
-                        cap_dec = Self::parse_ns(line) as u32;
-                    } else if line.starts_with("drm-engine-capacity-enc:") {
-                        cap_enc = Self::parse_ns(line) as u32;
+                        fd_enc += line.split_whitespace()
+                            .nth(1).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+                    } else if line.starts_with("drm-engine-jpeg:") {
+                        fd_jpeg += line.split_whitespace()
+                            .nth(1).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
                     }
                 }
 
-                let cid = client_id.unwrap_or(pid as u64);
-                let final_cap_dec = if cap_dec > 0 {
-                    cap_dec
-                } else {
-                    self.vcn_instances
-                };
-                let final_cap_enc = if cap_enc > 0 {
-                    cap_enc
-                } else {
-                    self.vcn_instances
-                };
+                let Some(cid) = client_id else { continue; };
 
-                current
-                    .entry(cid)
-                    .and_modify(|e| {
-                        e.1 = e.1.max(fd_dec);
-                        e.2 = e.2.max(fd_enc);
-                    })
-                    .or_insert_with(|| {
-                        if proc_name.is_empty() {
-                            proc_name = fs::read_to_string(format!("/proc/{}/comm", pid))
-                                .unwrap_or_default()
-                                .trim()
-                                .to_string();
-                        }
-                        (
-                            proc_name.clone(),
-                            fd_dec,
-                            fd_enc,
-                            final_cap_dec,
-                            final_cap_enc,
-                        )
-                    });
+                // KRİTİK: amdgpu_top'un drm_client_ids.insert() mantığı
+                // Aynı cid daha önce görüldüyse (başka bir fd'den) → ATLA
+                if !seen_cids.insert(cid) { continue; }
+
+                if proc_name.is_empty() {
+                    proc_name = fs::read_to_string(format!("/proc/{}/comm", pid))
+                        .unwrap_or_default().trim().to_string();
+                }
+
+                // PID bazlı biriktir (aynı pid'in birden fazla farklı cid'i olabilir)
+                pid_map
+                    .entry(pid)
+                    .and_modify(|e| { e.1 += fd_dec; e.2 += fd_enc; e.3 += fd_jpeg; })
+                    .or_insert_with(|| (proc_name.clone(), fd_dec, fd_enc, fd_jpeg));
             }
         }
 
-        let mut media_list: Vec<(String, u32, u32)> = Vec::new();
+        // Delta hesapla — prev pid bazlı tutulur
+        let mut result: Vec<(String, u32, u32)> = Vec::new();
 
-        for (cid, (name, dec_ns, enc_ns, cap_dec, cap_enc)) in &current {
-            if let Some(&(prev_dec, prev_enc, prev_t)) = self.prev.get(cid) {
-                let elapsed = now.duration_since(prev_t).as_nanos() as u64;
-                if elapsed == 0 {
-                    continue;
-                }
+        for (&pid, (name, dec_ns, enc_ns, jpeg_ns)) in &pid_map {
+            // prev key: pid (u64'e genişlet)
+            let prev_key = pid as u64;
+            if let Some(&(prev_dec, prev_enc, prev_jpeg, prev_t)) = self.prev.get(&prev_key) {
+                let elapsed = now.duration_since(prev_t).as_nanos() as i64;
+                if elapsed == 0 { continue; }
 
-                let dec_d = dec_ns.saturating_sub(prev_dec);
-                let enc_d = enc_ns.saturating_sub(prev_enc);
+                let dec_d  = dec_ns.saturating_sub(prev_dec).max(0);
+                let enc_d  = enc_ns.saturating_sub(prev_enc).max(0);
+                let jpeg_d = jpeg_ns.saturating_sub(prev_jpeg).max(0);
 
-                let dec_p = (((dec_d as f64 / elapsed as f64) * 100.0) as u32) / cap_dec;
-                let enc_p = (((enc_d as f64 / elapsed as f64) * 100.0) as u32) / cap_enc;
+                // ns → % (ham)
+                let dec_pct  = (dec_d  as f64 / elapsed as f64) * 100.0;
+                let enc_pct  = (enc_d  as f64 / elapsed as f64) * 100.0;
+                let jpeg_pct = (jpeg_d as f64 / elapsed as f64) * 100.0;
 
-                if dec_p > 0 || enc_p > 0 {
-                    media_list.push((name.clone(), dec_p, enc_p));
+                // amdgpu_top calc_usage: has_vcn=true, has_vcn_unified=false
+                // total_dec = (dec + vcn_jpeg) / 2
+                // total_enc = enc
+                let total_dec = ((dec_pct + jpeg_pct) / 2.0) as u32;
+                let total_enc = enc_pct as u32;
+
+                if total_dec > 0 || total_enc > 0 {
+                    result.push((name.clone(), total_dec.min(100), total_enc.min(100)));
                 }
             }
         }
 
+        // Prev güncelle — pid bazlı
         self.prev.clear();
-        for (cid, (_, dec_ns, enc_ns, _, _)) in &current {
-            self.prev.insert(*cid, (*dec_ns, *enc_ns, now));
+        for (&pid, (_, dec_ns, enc_ns, jpeg_ns)) in &pid_map {
+            self.prev.insert(pid as u64, (*dec_ns, *enc_ns, *jpeg_ns, now));
         }
 
-        media_list.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
-
-        AmdDecInfo {
-            media_procs: media_list,
-        }
-    }
-
-    fn parse_ns(line: &str) -> u64 {
-        line.split_whitespace()
-            .nth(1)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+        result.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+        AmdDecInfo { media_procs: result }
     }
 }
 
@@ -460,11 +446,7 @@ fn build_ui(app: &Application) {
             let gpu_backend = detect_gpu();
 
             let mut fdinfo_tracker = match &gpu_backend {
-                GpuBackend::Amd {
-                    pdev,
-                    vcn_instances,
-                    ..
-                } => Some(FdInfoTracker::new(pdev.clone(), *vcn_instances)),
+                GpuBackend::Amd { pdev, .. } => Some(FdInfoTracker::new(pdev.clone())),
                 _ => None,
             };
 
