@@ -174,6 +174,13 @@ enum GpuBackend {
         pdev: String,
         vcn_instances: u32,
     },
+    // Intel GPU (i915/xe sürücüsü)
+    // Güç: hwmon energy1_input (joule, sadece ayrık DG1/DG2/ArcGPU'larda mevcut)
+    // Sıcaklık: hwmon temp1_input (kernel 6.10+ ile bazı kartlarda)
+    // Entegre Intel GPU'da ikisi de mevcut olmayabilir → değerler 0 gösterilir
+    Intel {
+        hwmon_path: Option<String>, // None = entegre/desteklenmez
+    },
     None,
 }
 
@@ -195,12 +202,18 @@ enum GpuKind {
     Unknown,
     Nvidia,
     Amd,
+    Intel,
 }
 
 struct PowerTracker {
     last_energy: u64,
     last_time: Instant,
     path: Option<&'static str>,
+}
+
+struct GpuPowerTracker {
+    last_energy: u64,
+    last_time: Instant,
 }
 
 // ── Giriş noktası ─────────────────────────────────────────────────────────────
@@ -270,6 +283,13 @@ fn run_diagnostics(rapl_path: &Option<&'static str>, gpu: &GpuBackend) {
 
     println!("\n-- GPU Durumu --");
     match gpu {
+        GpuBackend::Intel { hwmon_path } => {
+            println!("✅ GPU Type  : Intel (i915/xe)");
+            match hwmon_path {
+                Some(p) => println!("   hwmon     : {}", p),
+                None    => println!("   hwmon     : Yok (entegre GPU veya desteklenmiyor)"),
+            }
+        }
         GpuBackend::Amd {
             hwmon_path,
             vcn_instances,
@@ -459,6 +479,7 @@ fn build_ui(app: &Application) {
 
             let gpu_backend = detect_gpu();
 
+            let mut intel_gpu_tracker: Option<GpuPowerTracker> = None;
             let mut fdinfo_tracker = match &gpu_backend {
                 GpuBackend::Amd {
                     pdev,
@@ -534,7 +555,7 @@ fn build_ui(app: &Application) {
 
                 let mut gpu_temp = 0.0f32;
                 let mut gpu_watt = 0.0f32;
-                let mut media_procs = Vec::new();
+                let mut media_procs: Vec<(String, u32, u32)> = Vec::new();
                 let mut gpu_kind = GpuKind::Unknown;
 
                 match &gpu_backend {
@@ -548,41 +569,35 @@ fn build_ui(app: &Application) {
                                 )
                                 .unwrap_or(0) as f32;
 
-                            let total_dec = dev
-                                .decoder_utilization()
-                                .map(|u| u.utilization)
-                                .unwrap_or(0);
-                            let total_enc = dev
-                                .encoder_utilization()
-                                .map(|u| u.utilization)
-                                .unwrap_or(0);
+                            let total_dec =
+                                dev.decoder_utilization().map(|u| u.utilization).unwrap_or(0);
+                            let total_enc =
+                                dev.encoder_utilization().map(|u| u.utilization).unwrap_or(0);
 
                             if total_dec > 0 || total_enc > 0 {
                                 sys.refresh_processes(ProcessesToUpdate::All, false);
-                                let mut proc_map: HashMap<u32, (u32, u32)> = HashMap::new();
                                 if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
+                                    let mut proc_map: HashMap<u32, (u32, u32)> = HashMap::new();
                                     for s in samples {
-                                        let e = proc_map.entry(s.pid).or_insert((0, 0));
-                                        if s.dec_util > 0 {
-                                            e.0 = s.dec_util;
-                                        }
-                                        if s.enc_util > 0 {
-                                            e.1 = s.enc_util;
+                                        if s.dec_util > 0 || s.enc_util > 0 {
+                                            proc_map
+                                                .entry(s.pid)
+                                                .and_modify(|e| {
+                                                    e.0 = e.0.max(s.dec_util);
+                                                    e.1 = e.1.max(s.enc_util);
+                                                })
+                                                .or_insert((s.dec_util, s.enc_util));
                                         }
                                     }
-                                }
-                                for (pid, (dec, enc)) in proc_map {
-                                    if dec > 0 || enc > 0 {
-                                        let mut name = String::new();
-                                        if let Some(proc) =
-                                            sys.process(sysinfo::Pid::from(pid as usize))
-                                        {
-                                            name = proc.name().to_string_lossy().into_owned();
-                                        }
+                                    for (pid, (dec, enc)) in proc_map {
+                                        let name = sys
+                                            .process(sysinfo::Pid::from(pid as usize))
+                                            .map(|p| p.name().to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| format!("pid:{}", pid));
                                         media_procs.push((name, dec, enc));
                                     }
+                                    media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
                                 }
-                                media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
                             }
                         }
                     }
@@ -590,20 +605,57 @@ fn build_ui(app: &Application) {
                     GpuBackend::Amd { hwmon_path, .. } => {
                         gpu_kind = GpuKind::Amd;
 
-                        let temp_path = format!("{}/temp1_input", hwmon_path);
-                        if let Ok(v) = read_u64(&temp_path) {
+                        if let Ok(v) = read_u64(&format!("{}/temp1_input", hwmon_path)) {
                             gpu_temp = v as f32 / 1000.0;
                         }
-
-                        let power_path = format!("{}/power1_average", hwmon_path);
-                        if let Ok(v) = read_u64(&power_path) {
+                        if let Ok(v) = read_u64(&format!("{}/power1_average", hwmon_path)) {
                             gpu_watt = v as f32 / 1_000_000.0;
                         }
-
                         if let Some(ref mut tracker) = fdinfo_tracker {
                             let info = tracker.sample();
                             media_procs = info.media_procs;
                         }
+                    }
+
+                    GpuBackend::Intel { hwmon_path } => {
+                        gpu_kind = GpuKind::Intel;
+
+                        // Sıcaklık: temp1_input (kernel 6.10+ ayrık Arc GPU'larda)
+                        // Entegre Intel GPU'da mevcut değil → 0 gösterilir
+                        if let Some(ref path) = hwmon_path {
+                            if let Ok(v) = read_u64(&format!("{}/temp1_input", path)) {
+                                gpu_temp = v as f32 / 1000.0;
+                            }
+                            // Güç: energy1_input (joule kümülatif) → delta/dt = Watt
+                            // Sadece ayrık Arc/DG1/DG2 GPU'larda mevcut
+                            let energy_path = format!("{}/energy1_input", path);
+                            if let Ok(current_e) = read_u64(&energy_path) {
+                                let now_t = Instant::now();
+                                if let Some(ref mut gpt) = intel_gpu_tracker {
+                                    let elapsed = now_t
+                                        .duration_since(gpt.last_time)
+                                        .as_secs_f32();
+                                    if elapsed > 0.1 {
+                                        let delta = current_e.saturating_sub(gpt.last_energy);
+                                        // energy1_input microjoule cinsinden
+                                        let w = delta as f32 / elapsed / 1_000_000.0;
+                                        if w > 0.5 && w < 300.0 {
+                                            gpu_watt = w;
+                                        }
+                                    }
+                                    gpt.last_energy = current_e;
+                                    gpt.last_time   = now_t;
+                                } else {
+                                    intel_gpu_tracker = Some(GpuPowerTracker {
+                                        last_energy: current_e,
+                                        last_time:   now_t,
+                                    });
+                                }
+                            }
+                        }
+                        // Intel GPU için DEC/ENC: fdinfo'da "i915" sürücüsü
+                        // drm-engine-video satırı mevcut kernellerde var
+                        // Şimdilik media_procs boş — ilerleyen versiyonda eklenebilir
                     }
 
                     GpuBackend::None => {}
@@ -710,6 +762,7 @@ fn get_vcn_instances(card_idx: u32) -> u32 {
 }
 
 fn detect_gpu() -> GpuBackend {
+    // 1. Nvidia: NVML
     if let Ok(nvml) = Nvml::init() {
         if nvml.device_by_index(0).is_ok() {
             return GpuBackend::Nvidia(Box::new(nvml));
@@ -718,11 +771,11 @@ fn detect_gpu() -> GpuBackend {
 
     for card_idx in 0..8u32 {
         let vendor_path = format!("/sys/class/drm/card{}/device/vendor", card_idx);
-        if let Ok(vendor) = fs::read_to_string(&vendor_path) {
-            if vendor.trim() != "0x1002" {
-                continue;
-            }
+        let Ok(vendor) = fs::read_to_string(&vendor_path) else { continue; };
+        let vendor = vendor.trim();
 
+        // 2. AMD: vendor 0x1002
+        if vendor == "0x1002" {
             let pdev_path = format!("/sys/class/drm/card{}/device/uevent", card_idx);
             let pdev = fs::read_to_string(&pdev_path)
                 .unwrap_or_default()
@@ -732,22 +785,41 @@ fn detect_gpu() -> GpuBackend {
                 .unwrap_or_default();
 
             let vcn_instances = get_vcn_instances(card_idx);
-
             let hwmon_base = format!("/sys/class/drm/card{}/device/hwmon", card_idx);
             if let Ok(entries) = fs::read_dir(&hwmon_base) {
                 for entry in entries.flatten() {
                     let hwmon_path = entry.path().to_string_lossy().into_owned();
-                    let has_temp = fs::metadata(format!("{}/temp1_input", hwmon_path)).is_ok();
+                    let has_temp  = fs::metadata(format!("{}/temp1_input",   hwmon_path)).is_ok();
                     let has_power = fs::metadata(format!("{}/power1_average", hwmon_path)).is_ok();
                     if has_temp || has_power {
-                        return GpuBackend::Amd {
-                            hwmon_path,
-                            pdev,
-                            vcn_instances,
-                        };
+                        return GpuBackend::Amd { hwmon_path, pdev, vcn_instances };
                     }
                 }
             }
+        }
+
+        // 3. Intel: vendor 0x8086, sürücü i915 veya xe
+        if vendor == "0x8086" {
+            // Sürücü kontrolü: i915 veya xe olmalı
+            let driver_path = format!("/sys/class/drm/card{}/device/driver", card_idx);
+            let driver_name = fs::read_link(&driver_path)
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+
+            if !matches!(driver_name.as_str(), "i915" | "xe") {
+                continue;
+            }
+
+            // hwmon yolunu bul — entegre GPU'da olmayabilir
+            let hwmon_base = format!("/sys/class/drm/card{}/device/hwmon", card_idx);
+            let hwmon_path = fs::read_dir(&hwmon_base)
+                .ok()
+                .and_then(|mut entries| entries.next())
+                .and_then(|e| e.ok())
+                .map(|e| e.path().to_string_lossy().into_owned());
+
+            return GpuBackend::Intel { hwmon_path };
         }
     }
 

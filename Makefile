@@ -1,57 +1,117 @@
-.PHONY: all deps build run install clean
+.PHONY: all deps build run install uninstall clean permissions
 
-# Proje adımız
-BIN_NAME = rust_power_panel
+# ── Proje ayarları ────────────────────────────────────────────────────────────
+BIN_NAME    = rust_power_panel
+INSTALL_DIR = /usr/local/bin
+UDEV_RULES  = /etc/udev/rules.d/99-$(BIN_NAME).rules
 
-# Varsayılan hedef
-all: deps run
+# ── Varsayılan hedef ──────────────────────────────────────────────────────────
+all: deps build
 
+# ── Sistem bağımlılıkları ─────────────────────────────────────────────────────
 deps:
 	@echo "=> Sistem bağımlılıkları kontrol ediliyor..."
-	@if pkg-config --exists gtk4 gtk4-layer-shell; then \
+	@MISSING=""; \
+	pkg-config --exists gtk4 2>/dev/null \
+	  || MISSING="$$MISSING gtk4"; \
+	{ pkg-config --exists gtk4-layer-shell 2>/dev/null \
+	  || pkg-config --exists gtk4-layer-shell-0 2>/dev/null; } \
+	  || MISSING="$$MISSING gtk4-layer-shell"; \
+	if [ -z "$$MISSING" ]; then \
 		echo "=> Bağımlılıklar zaten kurulu. Atlanıyor."; \
 	else \
-		echo "=> Eksik paketler tespit edildi, kuruluyor..."; \
+		echo "=> Eksik paketler:$$MISSING — kuruluyor..."; \
 		if command -v pacman > /dev/null; then \
 			sudo pacman -S --needed gtk4 gtk4-layer-shell pkgconf; \
 		elif command -v apt-get > /dev/null; then \
-			sudo apt-get update && sudo apt-get install -y libgtk-4-dev libgtk4-layer-shell-dev pkg-config; \
+			sudo apt-get update && sudo apt-get install -y \
+				libgtk-4-dev libgtk4-layer-shell-dev pkg-config; \
 		elif command -v dnf > /dev/null; then \
-			sudo dnf install -y gtk4-devel gtk4-layer-shell-devel pkgconf-pkg-config; \
+			sudo dnf install -y \
+				gtk4-devel gtk4-layer-shell-devel pkgconf-pkg-config; \
+		elif command -v zypper > /dev/null; then \
+			sudo zypper install -y \
+				gtk4-devel gtk4-layer-shell-devel pkg-config; \
 		else \
-			echo "=> Desteklenmeyen paket yöneticisi! Lütfen GTK4 ve gtk4-layer-shell kurun."; \
+			echo "=> HATA: Desteklenmeyen paket yöneticisi!"; \
+			echo "   Lütfen GTK4 ve gtk4-layer-shell paketlerini elle kurun."; \
 			exit 1; \
 		fi \
 	fi
 
+# ── Derleme ───────────────────────────────────────────────────────────────────
 build:
-	@echo "=> Rust projesi derleniyor (Release)..."
-	cargo build --release
+	@echo "=> $(BIN_NAME) derleniyor (release)..."
+	@cargo build --release
+	@echo "=> Derleme tamamlandı: target/release/$(BIN_NAME)"
 
-# Geliştirme aşamasında test etmek için (Sudo -E ile çalıştırır ki Wayland değişkenleri silinmesin)
+# ── Sensör izinleri (udev — sudo gerektirmez) ─────────────────────────────────
+permissions:
+	@echo "=> Sensör izinleri ayarlanıyor (udev kuralı)..."
+	@printf '%s\n' \
+		'# $(BIN_NAME) — CPU/GPU güç ve sıcaklık sensörlerine kullanıcı erişimi' \
+		'# RAPL (CPU güç tüketimi — Intel ve AMD)' \
+		'SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/powercap/"' \
+		'# RAPL (CPU güç tüketimi — Intel ve AMD)' \
+		'SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/powercap/intel-rapl:0/"' \
+		'# hwmon (CPU/GPU sıcaklık sensörleri)' \
+		'SUBSYSTEM=="hwmon", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/hwmon/"' \
+		| sudo tee $(UDEV_RULES) > /dev/null
+	@sudo chmod 0644 $(UDEV_RULES)
+	@sudo udevadm control --reload-rules
+	@sudo udevadm trigger --subsystem-match=powercap
+	@sudo udevadm trigger --subsystem-match=hwmon
+	@echo "=> ✅ Sensör izinleri aktif."
+
+# ── Geliştirme: direkt çalıştır ───────────────────────────────────────────────
+# make permissions yapıldıktan sonra sudo gerekmez.
 run: build
 	@echo "=> $(BIN_NAME) başlatılıyor..."
-	sudo -E ./target/release/$(BIN_NAME)
+	@./target/release/$(BIN_NAME)
 
-# "Tek Komutla Kurulum" Sihri Burada
-install: build
-	@echo "=> 1/4: Binary sisteme yükleniyor..."
-	@sudo cp target/release/$(BIN_NAME) /usr/local/bin/$(BIN_NAME)_bin
-	@sudo chmod +x /usr/local/bin/$(BIN_NAME)_bin
+# ── Kurulum ───────────────────────────────────────────────────────────────────
+# Klavye kısayolu kullanımına uygun: aç/kapat toggle script ile çalışır.
+install: build permissions
+	@echo ""
+	@echo "=> [1/2] Binary kuruluyor: $(INSTALL_DIR)/$(BIN_NAME)"
+	@sudo cp target/release/$(BIN_NAME) $(INSTALL_DIR)/$(BIN_NAME)
+	@sudo chmod 0755 $(INSTALL_DIR)/$(BIN_NAME)
+	@# Eski _bin wrapper'ı temizle (geçmiş kurulumdan kalma)
+	@if [ -f "$(INSTALL_DIR)/$(BIN_NAME)_bin" ]; then \
+		echo "=> Eski wrapper binary temizleniyor..."; \
+		sudo rm -f $(INSTALL_DIR)/$(BIN_NAME)_bin; \
+	fi
+	@echo ""
+	@echo "=> [2/2] Kurulum tamamlandı! 🎉"
+	@echo ""
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo " KDE Plasma Klavye Kısayolu Kurulumu"
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo ""
+	@echo " System Settings → Shortcuts → Custom Shortcuts"
+	@echo " → Edit → New → Global Shortcut → Command/URL"
+	@echo " Komut:"
+	@echo "   bash -c 'pgrep -x $(BIN_NAME) && pkill -x $(BIN_NAME) || $(INSTALL_DIR)/$(BIN_NAME)'"
+	@echo ""
+	@echo " Bu komut:"
+	@echo "   • Panel açıksa kapatır"
+	@echo "   • Panel kapalıysa açar"
+	@echo ""
+	@echo " Terminalde çalıştırmak için: $(BIN_NAME)"
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-	@echo "=> 2/4: Akıllı Wrapper Script oluşturuluyor..."
-	@echo '#!/bin/bash' | sudo tee /usr/local/bin/$(BIN_NAME) > /dev/null
-	@echo 'sudo -E /usr/local/bin/$(BIN_NAME)_bin "$$@"' | sudo tee -a /usr/local/bin/$(BIN_NAME) > /dev/null
-	@sudo chmod +x /usr/local/bin/$(BIN_NAME)
+# ── Kaldırma ─────────────────────────────────────────────────────────────────
+uninstall:
+	@echo "=> $(BIN_NAME) kaldırılıyor..."
+	@pkill -x $(BIN_NAME) 2>/dev/null || true
+	@sudo rm -f $(INSTALL_DIR)/$(BIN_NAME)
+	@sudo rm -f $(INSTALL_DIR)/$(BIN_NAME)_bin
+	@sudo rm -f $(UDEV_RULES)
+	@sudo udevadm control --reload-rules
+	@echo "=> $(BIN_NAME) tamamen kaldırıldı."
 
-	@echo "=> 3/4: Kernel Sensör İzinleri (Sudoers) ayarlanıyor..."
-	@echo "$$USER ALL=(ALL) NOPASSWD: /usr/local/bin/$(BIN_NAME)_bin" | sudo tee /etc/sudoers.d/$(BIN_NAME) > /dev/null
-	@echo "Defaults!/usr/local/bin/$(BIN_NAME)_bin env_keep += \"WAYLAND_DISPLAY XDG_RUNTIME_DIR\"" | sudo tee -a /etc/sudoers.d/$(BIN_NAME) > /dev/null
-	@sudo chmod 0440 /etc/sudoers.d/$(BIN_NAME)
-
-	@echo "=> 4/4: Kurulum Tamamlandı! 🎉"
-	@echo "Artık terminale sadece '$(BIN_NAME)' yazarak veya Hyprland/Sway config dosyanızdan çağırarak paneli kullanabilirsiniz."
-
+# ── Temizlik ──────────────────────────────────────────────────────────────────
 clean:
-	@echo "=> Temizleniyor..."
-	cargo clean
+	@echo "=> Build dosyaları temizleniyor..."
+	@cargo clean
+	@echo "=> Temizlendi."
