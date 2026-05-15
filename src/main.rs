@@ -545,36 +545,44 @@ fn read_gpu_data(
                     data.vram_used_mb = (mem.used / 1_048_576) as u32;
                     data.vram_total_mb = (mem.total / 1_048_576) as u32;
                 }
-                if let Ok(util) = dev.utilization_rates() {
-                    data.gfx_percent = util.gpu;
-                }
 
-                let total_dec = dev.decoder_utilization().map(|u| u.utilization).unwrap_or(0);
-                let total_enc = dev.encoder_utilization().map(|u| u.utilization).unwrap_or(0);
+                // process_utilization_stats covers both compute (sm_util) and media (dec/enc)
+                if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
+                    if !samples.is_empty() {
+                        // SM utilization sum = compute/GFX activity (covers LLM inference, etc.)
+                        let sm_sum: u32 = samples.iter().map(|s| s.sm_util).sum();
+                        data.gfx_percent = sm_sum.min(100);
 
-                if total_dec > 0 || total_enc > 0 {
-                    sys.refresh_processes(ProcessesToUpdate::All, false);
-                    if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
-                        let mut proc_map: HashMap<u32, (u32, u32)> = HashMap::new();
-                        for s in samples {
-                            if s.dec_util > 0 || s.enc_util > 0 {
-                                proc_map
-                                    .entry(s.pid)
-                                    .and_modify(|e| {
-                                        e.0 = e.0.max(s.dec_util);
-                                        e.1 = e.1.max(s.enc_util);
-                                    })
-                                    .or_insert((s.dec_util, s.enc_util));
+                        let has_media = samples.iter().any(|s| s.dec_util > 0 || s.enc_util > 0);
+                        if has_media {
+                            sys.refresh_processes(ProcessesToUpdate::All, false);
+                            let mut proc_map: HashMap<u32, (u32, u32)> = HashMap::new();
+                            for s in &samples {
+                                if s.dec_util > 0 || s.enc_util > 0 {
+                                    proc_map
+                                        .entry(s.pid)
+                                        .and_modify(|e| {
+                                            e.0 = e.0.max(s.dec_util);
+                                            e.1 = e.1.max(s.enc_util);
+                                        })
+                                        .or_insert((s.dec_util, s.enc_util));
+                                }
                             }
+                            for (pid, (dec, enc)) in proc_map {
+                                let name = sys
+                                    .process(sysinfo::Pid::from(pid as usize))
+                                    .map(|p| p.name().to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| format!("pid:{}", pid));
+                                data.media_procs.push((name, dec, enc));
+                            }
+                            data.media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
                         }
-                        for (pid, (dec, enc)) in proc_map {
-                            let name = sys
-                                .process(sysinfo::Pid::from(pid as usize))
-                                .map(|p| p.name().to_string_lossy().into_owned())
-                                .unwrap_or_else(|| format!("pid:{}", pid));
-                            data.media_procs.push((name, dec, enc));
-                        }
-                        data.media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+                    }
+                }
+                // Fallback: utilization_rates() if process stats returned nothing
+                if data.gfx_percent == 0 {
+                    if let Ok(util) = dev.utilization_rates() {
+                        data.gfx_percent = util.gpu;
                     }
                 }
             }
@@ -810,13 +818,11 @@ fn detect_cpu_temp_path() -> Option<String> {
 struct DisplayState {
     cpu_watt: f32,
     gpu_watt: f32,
-    vram_mb: f32,
-    gfx_pct: f32,
 }
 
 impl Default for DisplayState {
     fn default() -> Self {
-        Self { cpu_watt: 0.0, gpu_watt: 0.0, vram_mb: 0.0, gfx_pct: 0.0 }
+        Self { cpu_watt: 0.0, gpu_watt: 0.0 }
     }
 }
 
@@ -1092,11 +1098,9 @@ fn build_ui(app: &Application) {
         };
 
         let mut ds = display_state.borrow_mut();
-        const ALPHA: f32 = 0.25;
+        const ALPHA: f32 = 0.12;
         ds.cpu_watt += (target.cpu_watt - ds.cpu_watt) * ALPHA;
         ds.gpu_watt += (target.gpu_watt - ds.gpu_watt) * ALPHA;
-        ds.vram_mb  += (target.vram_used_mb as f32 - ds.vram_mb) * ALPHA;
-        ds.gfx_pct  += (target.gpu_gfx_percent as f32 - ds.gfx_pct) * ALPHA;
 
         total_label.set_text(&format!("⚡ {:>6.1} W", ds.cpu_watt + ds.gpu_watt));
 
@@ -1118,9 +1122,9 @@ fn build_ui(app: &Application) {
             vram_row.set_visible(true);
             vram_lbl.set_text(&format!(
                 "{:>5}/{:>5} MB",
-                ds.vram_mb as u32, target.vram_total_mb
+                target.vram_used_mb, target.vram_total_mb
             ));
-            gfx_lbl.set_text(&format!("{:>3}%", ds.gfx_pct as u32));
+            gfx_lbl.set_text(&format!("{:>3}%", target.gpu_gfx_percent));
         } else {
             vram_row.set_visible(false);
         }
