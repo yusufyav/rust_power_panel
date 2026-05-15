@@ -8,12 +8,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Components, ProcessesToUpdate, System};
 
-const APP_ID: &str = "com.github.yusufyav.rust_power_panel";
+const APP_ID: &str = "com.github.yusufyav.power_panel";
+
+fn parse_fdinfo_ns(line: &str) -> u64 {
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
 
 // ── AMD fdinfo tracker ────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone)]
-struct AmdDecInfo {
+struct MediaInfo {
     media_procs: Vec<(String, u32, u32)>,
 }
 
@@ -32,12 +39,12 @@ impl FdInfoTracker {
         }
     }
 
-    fn sample(&mut self) -> AmdDecInfo {
+    fn sample(&mut self) -> MediaInfo {
         let now = Instant::now();
         let mut current: HashMap<u64, (String, u64, u64, u32, u32)> = HashMap::new();
 
         let Ok(proc_dir) = fs::read_dir("/proc") else {
-            return AmdDecInfo::default();
+            return MediaInfo::default();
         };
 
         for entry in proc_dir.flatten() {
@@ -76,15 +83,15 @@ impl FdInfoTracker {
 
                 for line in content.lines() {
                     if line.starts_with("drm-client-id:") {
-                        client_id = Some(Self::parse_ns(line));
+                        client_id = Some(parse_fdinfo_ns(line));
                     } else if line.starts_with("drm-engine-dec:") {
-                        fd_dec = fd_dec.max(Self::parse_ns(line));
+                        fd_dec = fd_dec.max(parse_fdinfo_ns(line));
                     } else if line.starts_with("drm-engine-enc:") {
-                        fd_enc = fd_enc.max(Self::parse_ns(line));
+                        fd_enc = fd_enc.max(parse_fdinfo_ns(line));
                     } else if line.starts_with("drm-engine-capacity-dec:") {
-                        cap_dec = Self::parse_ns(line) as u32;
+                        cap_dec = parse_fdinfo_ns(line) as u32;
                     } else if line.starts_with("drm-engine-capacity-enc:") {
-                        cap_enc = Self::parse_ns(line) as u32;
+                        cap_enc = parse_fdinfo_ns(line) as u32;
                     }
                 }
 
@@ -152,16 +159,123 @@ impl FdInfoTracker {
 
         media_list.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
 
-        AmdDecInfo {
+        MediaInfo {
             media_procs: media_list,
         }
     }
+}
 
-    fn parse_ns(line: &str) -> u64 {
-        line.split_whitespace()
-            .nth(1)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+// ── Intel fdinfo tracker ──────────────────────────────────────────────────────
+
+struct IntelFdInfoTracker {
+    prev: HashMap<u64, (u64, Instant)>,
+}
+
+impl IntelFdInfoTracker {
+    fn new() -> Self {
+        Self {
+            prev: HashMap::new(),
+        }
+    }
+
+    fn sample(&mut self) -> MediaInfo {
+        let now = Instant::now();
+        let mut current: HashMap<u64, (String, u64)> = HashMap::new();
+
+        let Ok(proc_dir) = fs::read_dir("/proc") else {
+            return MediaInfo::default();
+        };
+
+        for entry in proc_dir.flatten() {
+            let fname = entry.file_name();
+            let pid_str = fname.to_string_lossy();
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
+
+            let fd_path = format!("/proc/{}/fd", pid);
+            let Ok(fd_dir) = fs::read_dir(&fd_path) else {
+                continue;
+            };
+
+            let mut proc_name = String::new();
+
+            for fd_entry in fd_dir.flatten() {
+                let fd_num = fd_entry.file_name();
+                let fdinfo_path = format!("/proc/{}/fdinfo/{}", pid, fd_num.to_string_lossy());
+                let Ok(content) = fs::read_to_string(&fdinfo_path) else {
+                    continue;
+                };
+
+                // Intel GPU: i915 veya xe sürücüsü
+                if !content.contains("i915") && !content.contains("xe") {
+                    continue;
+                }
+
+                let mut client_id = None;
+                let mut video_ns: u64 = 0;
+
+                for line in content.lines() {
+                    if line.starts_with("drm-client-id:") {
+                        client_id = Some(parse_fdinfo_ns(line));
+                    } else if line.starts_with("drm-engine-video:") {
+                        // Intel'de video engine decode+encode toplamını verir
+                        video_ns = video_ns.max(parse_fdinfo_ns(line));
+                    }
+                }
+
+                if video_ns == 0 {
+                    continue;
+                }
+
+                let cid = client_id.unwrap_or(pid as u64);
+
+                current
+                    .entry(cid)
+                    .and_modify(|e| {
+                        e.1 = e.1.max(video_ns);
+                    })
+                    .or_insert_with(|| {
+                        if proc_name.is_empty() {
+                            proc_name = fs::read_to_string(format!("/proc/{}/comm", pid))
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                        }
+                        (proc_name.clone(), video_ns)
+                    });
+            }
+        }
+
+        let mut media_list: Vec<(String, u32, u32)> = Vec::new();
+
+        for (cid, (name, video_ns)) in &current {
+            if let Some(&(prev_video, prev_t)) = self.prev.get(cid) {
+                let elapsed = now.duration_since(prev_t).as_nanos() as u64;
+                if elapsed == 0 {
+                    continue;
+                }
+
+                let video_d = video_ns.saturating_sub(prev_video);
+                let video_p = ((video_d as f64 / elapsed as f64) * 100.0) as u32;
+
+                if video_p > 0 {
+                    // Intel'de ayrı dec/enc yok, toplamı "DEC" sütununda göster
+                    media_list.push((name.clone(), video_p, 0));
+                }
+            }
+        }
+
+        self.prev.clear();
+        for (cid, (_, video_ns)) in &current {
+            self.prev.insert(*cid, (*video_ns, now));
+        }
+
+        media_list.sort_by(|a, b| b.1.cmp(&a.1));
+
+        MediaInfo {
+            media_procs: media_list,
+        }
     }
 }
 
@@ -175,11 +289,11 @@ enum GpuBackend {
         vcn_instances: u32,
     },
     // Intel GPU (i915/xe sürücüsü)
-    // Güç: hwmon energy1_input (joule, sadece ayrık DG1/DG2/ArcGPU'larda mevcut)
+    // Güç: RAPL uncore domain (entegre iGPU) veya hwmon energy1_input (ayrık Arc)
     // Sıcaklık: hwmon temp1_input (kernel 6.10+ ile bazı kartlarda)
-    // Entegre Intel GPU'da ikisi de mevcut olmayabilir → değerler 0 gösterilir
     Intel {
-        hwmon_path: Option<String>, // None = entegre/desteklenmez
+        hwmon_path: Option<String>,      // Arc GPU için hwmon
+        rapl_uncore_path: Option<String>, // Entegre iGPU için RAPL uncore
     },
     None,
 }
@@ -219,9 +333,292 @@ struct GpuPowerTracker {
 // ── Giriş noktası ─────────────────────────────────────────────────────────────
 
 fn main() -> glib::ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+
+    // CLI modu kontrolü
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "--help" | "-h" => {
+                print_help();
+                return glib::ExitCode::SUCCESS;
+            }
+            "--cli" => {
+                run_cli_mode();
+                return glib::ExitCode::SUCCESS;
+            }
+            "--debug" => {
+                let rapl_path = find_rapl_path();
+                let gpu = detect_gpu();
+                run_diagnostics(&rapl_path, &gpu);
+                return glib::ExitCode::SUCCESS;
+            }
+            "--version" | "-v" => {
+                println!("PowerPanel v0.1.0");
+                println!("Minimal power monitoring tool for Linux");
+                return glib::ExitCode::SUCCESS;
+            }
+            _ => {
+                eprintln!("❌ Bilinmeyen parametre: {}", args[1]);
+                eprintln!("Yardım için: {} --help", args[0]);
+                return glib::ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // GUI modu (varsayılan)
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     app.run()
+}
+
+fn print_help() {
+    println!("PowerPanel - Minimal Linux Güç İzleme Aracı");
+    println!();
+    println!("KULLANIM:");
+    println!("  power_panel [SEÇENEKLER]");
+    println!();
+    println!("SEÇENEKLER:");
+    println!("  --help, -h       Bu yardım mesajını gösterir");
+    println!("  --version, -v    Versiyon bilgisini gösterir");
+    println!("  --cli            CLI (Terminal) modunda çalıştır");
+    println!("  --debug          Sensör teşhisini çalıştır ve çık");
+    println!();
+    println!("ÖRNEKLER:");
+    println!("  power_panel              # GUI modunda çalıştır (varsayılan)");
+    println!("  power_panel --cli        # Terminal modunda sürekli güncelleme");
+    println!("  power_panel --debug      # Sensör erişimini ve GPU durumunu kontrol et");
+    println!();
+    println!("ÖZELLİKLER:");
+    println!("  • CPU/GPU güç tüketimi ve sıcaklık");
+    println!("  • GPU decode/encode kullanımı");
+    println!("  • AMD, Intel, Nvidia desteği");
+    println!("  • Düşük kaynak kullanımı (<10 MB RAM)");
+}
+
+fn run_cli_mode() {
+    use std::io::{self, Write};
+
+    println!("🔌 PowerPanel CLI Modu - Çıkmak için Ctrl+C");
+    println!();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let gpu_backend = detect_gpu();
+        let mut sys = System::new();
+        
+        let mut intel_gpu_tracker: Option<GpuPowerTracker> = None;
+        let mut amd_fdinfo_tracker = match &gpu_backend {
+            GpuBackend::Amd { pdev, vcn_instances, .. } => {
+                Some(FdInfoTracker::new(pdev.clone(), *vcn_instances))
+            }
+            _ => None,
+        };
+        let mut intel_fdinfo_tracker = match &gpu_backend {
+            GpuBackend::Intel { .. } => Some(IntelFdInfoTracker::new()),
+            _ => None,
+        };
+
+        let mut cpu_tracker = PowerTracker {
+            path: find_rapl_path(),
+            last_energy: 0,
+            last_time: Instant::now(),
+        };
+        if let Some(p) = cpu_tracker.path {
+            cpu_tracker.last_energy = read_u64(p).unwrap_or(0);
+        }
+
+        let cpu_temp_path = detect_cpu_temp_path();
+
+        loop {
+            // CPU Sıcaklık
+            let cpu_temp = if let Some(ref path) = cpu_temp_path {
+                read_u64(path).map(|v| v as f32 / 1000.0).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+
+            // CPU Güç
+            let cpu_watt = if let Some(path) = cpu_tracker.path {
+                match read_u64(path) {
+                    Ok(current) => {
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(cpu_tracker.last_time).as_secs_f32();
+                        let watts = if elapsed > 0.1 {
+                            let diff = current.saturating_sub(cpu_tracker.last_energy);
+                            (diff as f32 / elapsed) / 1_000_000.0
+                        } else {
+                            0.0
+                        };
+                        cpu_tracker.last_energy = current;
+                        cpu_tracker.last_time = now;
+                        if watts > 1.0 && watts < 400.0 { watts } else { 0.0 }
+                    }
+                    Err(_) => 0.0,
+                }
+            } else {
+                0.0
+            };
+
+            // GPU verilerini al
+            let (gpu_temp, gpu_watt, media_procs, _) = read_gpu_data(
+                &gpu_backend,
+                &mut sys,
+                &mut intel_gpu_tracker,
+                &mut amd_fdinfo_tracker,
+                &mut intel_fdinfo_tracker,
+            );
+
+            // Ekranı temizle ve yazdır
+            print!("\x1B[2J\x1B[1;1H"); // ANSI clear screen
+            println!("⚡ TOPLAM: {:.1} W", cpu_watt + gpu_watt);
+            println!();
+            println!(" CPU: {:.1} W  │  {} °C", cpu_watt, cpu_temp.floor() as u32);
+            println!("󰢮 GPU: {:.1} W  │  {} °C", gpu_watt, gpu_temp.floor() as u32);
+            
+            if !media_procs.is_empty() {
+                println!();
+                println!("Media Engines:");
+                for (name, dec, enc) in media_procs.iter().take(3) {
+                    println!("  {:<14}  DEC: {:>3}%  ENC: {:>3}%", name, dec, enc);
+                }
+            }
+
+            io::stdout().flush().unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+    });
+}
+
+fn read_gpu_data(
+    gpu_backend: &GpuBackend,
+    sys: &mut System,
+    intel_gpu_tracker: &mut Option<GpuPowerTracker>,
+    amd_fdinfo_tracker: &mut Option<FdInfoTracker>,
+    intel_fdinfo_tracker: &mut Option<IntelFdInfoTracker>,
+) -> (f32, f32, Vec<(String, u32, u32)>, GpuKind) {
+    let mut gpu_temp = 0.0f32;
+    let mut gpu_watt = 0.0f32;
+    let mut media_procs = Vec::new();
+    let mut gpu_kind = GpuKind::Unknown;
+
+    match gpu_backend {
+        GpuBackend::Nvidia(nvml) => {
+            gpu_kind = GpuKind::Nvidia;
+            if let Ok(dev) = nvml.device_by_index(0) {
+                gpu_watt = dev.power_usage().unwrap_or(0) as f32 / 1000.0;
+                gpu_temp = dev
+                    .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
+                    .unwrap_or(0) as f32;
+
+                let total_dec = dev.decoder_utilization().map(|u| u.utilization).unwrap_or(0);
+                let total_enc = dev.encoder_utilization().map(|u| u.utilization).unwrap_or(0);
+
+                if total_dec > 0 || total_enc > 0 {
+                    sys.refresh_processes(ProcessesToUpdate::All, false);
+                    if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
+                        let mut proc_map: HashMap<u32, (u32, u32)> = HashMap::new();
+                        for s in samples {
+                            if s.dec_util > 0 || s.enc_util > 0 {
+                                proc_map
+                                    .entry(s.pid)
+                                    .and_modify(|e| {
+                                        e.0 = e.0.max(s.dec_util);
+                                        e.1 = e.1.max(s.enc_util);
+                                    })
+                                    .or_insert((s.dec_util, s.enc_util));
+                            }
+                        }
+                        for (pid, (dec, enc)) in proc_map {
+                            let name = sys
+                                .process(sysinfo::Pid::from(pid as usize))
+                                .map(|p| p.name().to_string_lossy().into_owned())
+                                .unwrap_or_else(|| format!("pid:{}", pid));
+                            media_procs.push((name, dec, enc));
+                        }
+                        media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+                    }
+                }
+            }
+        }
+        GpuBackend::Amd { hwmon_path, .. } => {
+            gpu_kind = GpuKind::Amd;
+            if let Ok(v) = read_u64(&format!("{}/temp1_input", hwmon_path)) {
+                gpu_temp = v as f32 / 1000.0;
+            }
+            if let Ok(v) = read_u64(&format!("{}/power1_average", hwmon_path)) {
+                gpu_watt = v as f32 / 1_000_000.0;
+            }
+            if let Some(tracker) = amd_fdinfo_tracker {
+                let info = tracker.sample();
+                media_procs = info.media_procs;
+            }
+        }
+        GpuBackend::Intel { hwmon_path, rapl_uncore_path } => {
+            gpu_kind = GpuKind::Intel;
+            // Sıcaklık (Arc GPU)
+            if let Some(ref path) = hwmon_path {
+                if let Ok(v) = read_u64(&format!("{}/temp1_input", path)) {
+                    gpu_temp = v as f32 / 1000.0;
+                }
+            }
+
+            // Güç: önce RAPL uncore (entegre iGPU), sonra hwmon (Arc)
+            if let Some(ref rapl_path) = rapl_uncore_path {
+                if let Ok(current_e) = read_u64(rapl_path) {
+                    let now_t = Instant::now();
+                    if let Some(ref mut gpt) = intel_gpu_tracker {
+                        let elapsed = now_t.duration_since(gpt.last_time).as_secs_f32();
+                        if elapsed > 0.1 {
+                            let delta = current_e.saturating_sub(gpt.last_energy);
+                            let w = delta as f32 / elapsed / 1_000_000.0;
+                            if w > 0.1 && w < 100.0 {
+                                gpu_watt = w;
+                            }
+                        }
+                        gpt.last_energy = current_e;
+                        gpt.last_time = now_t;
+                    } else {
+                        *intel_gpu_tracker = Some(GpuPowerTracker {
+                            last_energy: current_e,
+                            last_time: now_t,
+                        });
+                    }
+                }
+            } else if let Some(ref path) = hwmon_path {
+                // Fallback: Arc GPU hwmon
+                let energy_path = format!("{}/energy1_input", path);
+                if let Ok(current_e) = read_u64(&energy_path) {
+                    let now_t = Instant::now();
+                    if let Some(ref mut gpt) = intel_gpu_tracker {
+                        let elapsed = now_t.duration_since(gpt.last_time).as_secs_f32();
+                        if elapsed > 0.1 {
+                            let delta = current_e.saturating_sub(gpt.last_energy);
+                            let w = delta as f32 / elapsed / 1_000_000.0;
+                            if w > 0.5 && w < 300.0 {
+                                gpu_watt = w;
+                            }
+                        }
+                        gpt.last_energy = current_e;
+                        gpt.last_time = now_t;
+                    } else {
+                        *intel_gpu_tracker = Some(GpuPowerTracker {
+                            last_energy: current_e,
+                            last_time: now_t,
+                        });
+                    }
+                }
+            }
+
+            // Decode/Encode
+            if let Some(tracker) = intel_fdinfo_tracker {
+                let info = tracker.sample();
+                media_procs = info.media_procs;
+            }
+        }
+        GpuBackend::None => {}
+    }
+
+    (gpu_temp, gpu_watt, media_procs, gpu_kind)
 }
 
 // ── DIAGNOSTICS (TEŞHİS) MOTORU V4 (Sudo Korumalı) ───────────────
@@ -283,11 +680,15 @@ fn run_diagnostics(rapl_path: &Option<&'static str>, gpu: &GpuBackend) {
 
     println!("\n-- GPU Durumu --");
     match gpu {
-        GpuBackend::Intel { hwmon_path } => {
+        GpuBackend::Intel { hwmon_path, rapl_uncore_path } => {
             println!("✅ GPU Type  : Intel (i915/xe)");
             match hwmon_path {
                 Some(p) => println!("   hwmon     : {}", p),
-                None    => println!("   hwmon     : Yok (entegre GPU veya desteklenmiyor)"),
+                None => println!("   hwmon     : Yok (entegre GPU)"),
+            }
+            match rapl_uncore_path {
+                Some(p) => println!("   RAPL iGPU : {} (Entegre GPU güç)", p),
+                None => println!("   RAPL iGPU : Yok"),
             }
         }
         GpuBackend::Amd {
@@ -319,13 +720,13 @@ fn detect_cpu_temp_path() -> Option<String> {
         if let Ok(name) = fs::read_to_string(path.join("name")) {
             let name = name.trim().to_lowercase();
 
-            // SKORLAMA SİSTEMİ (k10temp ve asusec eklendi)
+            // SKORLAMA SİSTEMİ (Intel coretemp yükseltildi)
             let score = match name.as_str() {
                 "k10temp" => 100,
+                "coretemp" => 95, // Intel CPU için öncelikli
                 "zenpower" => 90,
-                "asusec" => 85, // Senin anakartının özel sensörü
+                "asusec" => 85,
                 "nct6775" | "nct6687" => 80,
-                "coretemp" => 70,
                 "acpitz" => 50,
                 "asus" | "wmi" => 40,
                 _ => continue,
@@ -338,10 +739,10 @@ fn detect_cpu_temp_path() -> Option<String> {
                     let label_path = path.join(format!("temp{}_label", i));
                     if let Ok(label) = fs::read_to_string(&label_path) {
                         let label_lower = label.trim().to_lowercase();
-                        // asusec "CPU", k10temp "Tctl" yazar. İkisini de kapsadık!
+                        // Intel: "Package id 0", AMD: "Tctl/Tdie"
                         if label_lower.contains("tdie")
                             || label_lower.contains("tctl")
-                            || label_lower.contains("package")
+                            || label_lower.contains("package id")
                             || label_lower.contains("cpu")
                         {
                             target_file = path.join(format!("temp{}_input", i));
@@ -475,17 +876,21 @@ fn build_ui(app: &Application) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let mut comps = Components::new_with_refreshed_list();
-            let mut sys = System::new_all();
+            let mut sys = System::new();
 
             let gpu_backend = detect_gpu();
 
             let mut intel_gpu_tracker: Option<GpuPowerTracker> = None;
-            let mut fdinfo_tracker = match &gpu_backend {
+            let mut amd_fdinfo_tracker = match &gpu_backend {
                 GpuBackend::Amd {
                     pdev,
                     vcn_instances,
                     ..
                 } => Some(FdInfoTracker::new(pdev.clone(), *vcn_instances)),
+                _ => None,
+            };
+            let mut intel_fdinfo_tracker = match &gpu_backend {
+                GpuBackend::Intel { .. } => Some(IntelFdInfoTracker::new()),
                 _ => None,
             };
 
@@ -499,34 +904,49 @@ fn build_ui(app: &Application) {
             }
 
             // TEŞHİS MOTORUNU ÇALIŞTIRIYORUZ
+            #[cfg(debug_assertions)]
             run_diagnostics(&tracker.path, &gpu_backend);
 
+            // CPU sıcaklık sensörünü kernel'den direkt okumak için
+            let cpu_temp_path = detect_cpu_temp_path();
+
             loop {
-                comps.refresh(false);
-                let mut cpu_temp = 0.0f32;
-                let mut found_die = false;
-                for c in &comps {
-                    let lbl = c.label().to_lowercase();
-                    if lbl == "tdie" {
-                        if let Some(t) = c.temperature() {
-                            cpu_temp = t;
-                            found_die = true;
-                            break;
-                        }
-                    }
-                }
-                if !found_die {
+                // CPU sıcaklık: direkt kernel'den oku (hem AMD hem Intel için daha güvenilir)
+                let cpu_temp = if let Some(ref path) = cpu_temp_path {
+                    read_u64(path).map(|v| v as f32 / 1000.0).unwrap_or(0.0)
+                } else {
+                    // Fallback: sysinfo Components API
+                    comps.refresh(false);
+                    let mut temp = 0.0f32;
+                    let mut found_die = false;
                     for c in &comps {
                         let lbl = c.label().to_lowercase();
-                        if lbl == "tctl" || lbl.contains("k10") || lbl.contains("composite") {
+                        if lbl == "tdie" {
                             if let Some(t) = c.temperature() {
-                                if t > cpu_temp {
-                                    cpu_temp = t;
+                                temp = t;
+                                found_die = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found_die {
+                        for c in &comps {
+                            let lbl = c.label().to_lowercase();
+                            if lbl == "tctl" 
+                                || lbl.contains("k10") 
+                                || lbl.contains("composite")
+                                || lbl.contains("package") 
+                            {
+                                if let Some(t) = c.temperature() {
+                                    if t > temp {
+                                        temp = t;
+                                    }
                                 }
                             }
                         }
                     }
-                }
+                    temp
+                };
 
                 let cpu_watt = if let Some(path) = tracker.path {
                     match read_u64(path) {
@@ -553,113 +973,13 @@ fn build_ui(app: &Application) {
                     0.0
                 };
 
-                let mut gpu_temp = 0.0f32;
-                let mut gpu_watt = 0.0f32;
-                let mut media_procs: Vec<(String, u32, u32)> = Vec::new();
-                let mut gpu_kind = GpuKind::Unknown;
-
-                match &gpu_backend {
-                    GpuBackend::Nvidia(nvml) => {
-                        gpu_kind = GpuKind::Nvidia;
-                        if let Ok(dev) = nvml.device_by_index(0) {
-                            gpu_watt = dev.power_usage().unwrap_or(0) as f32 / 1000.0;
-                            gpu_temp = dev
-                                .temperature(
-                                    nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu,
-                                )
-                                .unwrap_or(0) as f32;
-
-                            let total_dec =
-                                dev.decoder_utilization().map(|u| u.utilization).unwrap_or(0);
-                            let total_enc =
-                                dev.encoder_utilization().map(|u| u.utilization).unwrap_or(0);
-
-                            if total_dec > 0 || total_enc > 0 {
-                                sys.refresh_processes(ProcessesToUpdate::All, false);
-                                if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
-                                    let mut proc_map: HashMap<u32, (u32, u32)> = HashMap::new();
-                                    for s in samples {
-                                        if s.dec_util > 0 || s.enc_util > 0 {
-                                            proc_map
-                                                .entry(s.pid)
-                                                .and_modify(|e| {
-                                                    e.0 = e.0.max(s.dec_util);
-                                                    e.1 = e.1.max(s.enc_util);
-                                                })
-                                                .or_insert((s.dec_util, s.enc_util));
-                                        }
-                                    }
-                                    for (pid, (dec, enc)) in proc_map {
-                                        let name = sys
-                                            .process(sysinfo::Pid::from(pid as usize))
-                                            .map(|p| p.name().to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| format!("pid:{}", pid));
-                                        media_procs.push((name, dec, enc));
-                                    }
-                                    media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
-                                }
-                            }
-                        }
-                    }
-
-                    GpuBackend::Amd { hwmon_path, .. } => {
-                        gpu_kind = GpuKind::Amd;
-
-                        if let Ok(v) = read_u64(&format!("{}/temp1_input", hwmon_path)) {
-                            gpu_temp = v as f32 / 1000.0;
-                        }
-                        if let Ok(v) = read_u64(&format!("{}/power1_average", hwmon_path)) {
-                            gpu_watt = v as f32 / 1_000_000.0;
-                        }
-                        if let Some(ref mut tracker) = fdinfo_tracker {
-                            let info = tracker.sample();
-                            media_procs = info.media_procs;
-                        }
-                    }
-
-                    GpuBackend::Intel { hwmon_path } => {
-                        gpu_kind = GpuKind::Intel;
-
-                        // Sıcaklık: temp1_input (kernel 6.10+ ayrık Arc GPU'larda)
-                        // Entegre Intel GPU'da mevcut değil → 0 gösterilir
-                        if let Some(ref path) = hwmon_path {
-                            if let Ok(v) = read_u64(&format!("{}/temp1_input", path)) {
-                                gpu_temp = v as f32 / 1000.0;
-                            }
-                            // Güç: energy1_input (joule kümülatif) → delta/dt = Watt
-                            // Sadece ayrık Arc/DG1/DG2 GPU'larda mevcut
-                            let energy_path = format!("{}/energy1_input", path);
-                            if let Ok(current_e) = read_u64(&energy_path) {
-                                let now_t = Instant::now();
-                                if let Some(ref mut gpt) = intel_gpu_tracker {
-                                    let elapsed = now_t
-                                        .duration_since(gpt.last_time)
-                                        .as_secs_f32();
-                                    if elapsed > 0.1 {
-                                        let delta = current_e.saturating_sub(gpt.last_energy);
-                                        // energy1_input microjoule cinsinden
-                                        let w = delta as f32 / elapsed / 1_000_000.0;
-                                        if w > 0.5 && w < 300.0 {
-                                            gpu_watt = w;
-                                        }
-                                    }
-                                    gpt.last_energy = current_e;
-                                    gpt.last_time   = now_t;
-                                } else {
-                                    intel_gpu_tracker = Some(GpuPowerTracker {
-                                        last_energy: current_e,
-                                        last_time:   now_t,
-                                    });
-                                }
-                            }
-                        }
-                        // Intel GPU için DEC/ENC: fdinfo'da "i915" sürücüsü
-                        // drm-engine-video satırı mevcut kernellerde var
-                        // Şimdilik media_procs boş — ilerleyen versiyonda eklenebilir
-                    }
-
-                    GpuBackend::None => {}
-                }
+                let (gpu_temp, gpu_watt, media_procs, gpu_kind) = read_gpu_data(
+                    &gpu_backend,
+                    &mut sys,
+                    &mut intel_gpu_tracker,
+                    &mut amd_fdinfo_tracker,
+                    &mut intel_fdinfo_tracker,
+                );
 
                 if let Ok(mut d) = data_writer.lock() {
                     d.cpu_temp = cpu_temp;
@@ -761,6 +1081,58 @@ fn get_vcn_instances(card_idx: u32) -> u32 {
     1
 }
 
+fn find_intel_gpu_hwmon() -> Option<String> {
+    let Ok(entries) = fs::read_dir("/sys/class/hwmon") else {
+        return None;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(name) = fs::read_to_string(path.join("name")) {
+            let name = name.trim();
+            // Intel GPU sensörleri i915 veya xe adıyla tanımlanır
+            if matches!(name, "i915" | "xe") {
+                return Some(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+fn find_intel_rapl_uncore() -> Option<String> {
+    // Intel RAPL uncore domain (entegre iGPU güç tüketimi)
+    // Genelde: /sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1/energy_uj
+    // veya:     /sys/class/powercap/intel-rapl:0/intel-rapl:0:1/energy_uj
+    
+    let base_paths = [
+        "/sys/class/powercap/intel-rapl/intel-rapl:0",
+        "/sys/class/powercap/intel-rapl:0",
+    ];
+
+    for base in &base_paths {
+        // Alt zone'ları tara
+        if let Ok(entries) = fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name_file = path.join("name");
+                
+                if let Ok(name) = fs::read_to_string(&name_file) {
+                    let name_lower = name.trim().to_lowercase();
+                    // uncore = iGPU güç tüketimi
+                    if name_lower.contains("uncore") {
+                        let energy_file = path.join("energy_uj");
+                        if fs::metadata(&energy_file).is_ok() {
+                            return Some(energy_file.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    None
+}
+
 fn detect_gpu() -> GpuBackend {
     // 1. Nvidia: NVML
     if let Ok(nvml) = Nvml::init() {
@@ -771,7 +1143,9 @@ fn detect_gpu() -> GpuBackend {
 
     for card_idx in 0..8u32 {
         let vendor_path = format!("/sys/class/drm/card{}/device/vendor", card_idx);
-        let Ok(vendor) = fs::read_to_string(&vendor_path) else { continue; };
+        let Ok(vendor) = fs::read_to_string(&vendor_path) else {
+            continue;
+        };
         let vendor = vendor.trim();
 
         // 2. AMD: vendor 0x1002
@@ -789,10 +1163,14 @@ fn detect_gpu() -> GpuBackend {
             if let Ok(entries) = fs::read_dir(&hwmon_base) {
                 for entry in entries.flatten() {
                     let hwmon_path = entry.path().to_string_lossy().into_owned();
-                    let has_temp  = fs::metadata(format!("{}/temp1_input",   hwmon_path)).is_ok();
+                    let has_temp = fs::metadata(format!("{}/temp1_input", hwmon_path)).is_ok();
                     let has_power = fs::metadata(format!("{}/power1_average", hwmon_path)).is_ok();
                     if has_temp || has_power {
-                        return GpuBackend::Amd { hwmon_path, pdev, vcn_instances };
+                        return GpuBackend::Amd {
+                            hwmon_path,
+                            pdev,
+                            vcn_instances,
+                        };
                     }
                 }
             }
@@ -811,15 +1189,13 @@ fn detect_gpu() -> GpuBackend {
                 continue;
             }
 
-            // hwmon yolunu bul — entegre GPU'da olmayabilir
-            let hwmon_base = format!("/sys/class/drm/card{}/device/hwmon", card_idx);
-            let hwmon_path = fs::read_dir(&hwmon_base)
-                .ok()
-                .and_then(|mut entries| entries.next())
-                .and_then(|e| e.ok())
-                .map(|e| e.path().to_string_lossy().into_owned());
+            // Intel GPU için hwmon sensörünü /sys/class/hwmon altında ara (Arc GPU)
+            let hwmon_path = find_intel_gpu_hwmon();
+            
+            // RAPL uncore yolunu bul (entegre iGPU güç tüketimi)
+            let rapl_uncore_path = find_intel_rapl_uncore();
 
-            return GpuBackend::Intel { hwmon_path };
+            return GpuBackend::Intel { hwmon_path, rapl_uncore_path };
         }
     }
 

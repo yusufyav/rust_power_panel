@@ -1,15 +1,34 @@
-.PHONY: all deps build run install uninstall clean permissions
+.PHONY: all deps build run install uninstall clean permissions help
 
 # ── Proje ayarları ────────────────────────────────────────────────────────────
-BIN_NAME    = rust_power_panel
+BIN_NAME    = power_panel
 INSTALL_DIR = /usr/local/bin
 UDEV_RULES  = /etc/udev/rules.d/99-$(BIN_NAME).rules
 
 # ── Varsayılan hedef ──────────────────────────────────────────────────────────
 all: deps build
 
+# ── Yardım ───────────────────────────────────────────────────────────────────
+help:
+	@echo ""
+	@echo "PowerPanel — Kullanılabilir Hedefler"
+	@echo "────────────────────────────────────────"
+	@echo "  make               Bağımlılıkları kur + derle"
+	@echo "  make run           Derle + çalıştır"
+	@echo "  make permissions   Sensör izinlerini kur (udev, tek seferlik)"
+	@echo "  make install       Sisteme kur + izinleri ayarla"
+	@echo "  make uninstall     Kurulumu kaldır"
+	@echo "  make clean         Build dosyalarını temizle"
+	@echo "  make help          Bu mesajı göster"
+	@echo ""
+	@echo "NOT: 'make run' öncesinde 'make permissions' yapılmamışsa"
+	@echo "     güç değerleri 0.0 W görünebilir (RAPL erişim sorunu)."
+	@echo ""
+
 # ── Sistem bağımlılıkları ─────────────────────────────────────────────────────
 deps:
+	@command -v cargo > /dev/null 2>&1 \
+	  || { echo "❌ Rust/Cargo kurulu değil. Kurmak için: https://rustup.rs"; exit 1; }
 	@echo "=> Sistem bağımlılıkları kontrol ediliyor..."
 	@MISSING=""; \
 	pkg-config --exists gtk4 2>/dev/null \
@@ -47,25 +66,32 @@ build:
 
 # ── Sensör izinleri (udev — sudo gerektirmez) ─────────────────────────────────
 permissions:
-	@echo "=> Sensör izinleri ayarlanıyor (udev kuralı)..."
-	@printf '%s\n' \
-		'# $(BIN_NAME) — CPU/GPU güç ve sıcaklık sensörlerine kullanıcı erişimi' \
-		'# RAPL (CPU güç tüketimi — Intel ve AMD)' \
-		'SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/powercap/"' \
-		'# RAPL (CPU güç tüketimi — Intel ve AMD)' \
-		'SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/powercap/intel-rapl:0/"' \
-		'# hwmon (CPU/GPU sıcaklık sensörleri)' \
-		'SUBSYSTEM=="hwmon", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/hwmon/"' \
-		| sudo tee $(UDEV_RULES) > /dev/null
-	@sudo chmod 0644 $(UDEV_RULES)
-	@sudo udevadm control --reload-rules
-	@sudo udevadm trigger --subsystem-match=powercap
-	@sudo udevadm trigger --subsystem-match=hwmon
-	@echo "=> ✅ Sensör izinleri aktif."
+	@if [ -f "$(UDEV_RULES)" ]; then \
+		echo "=> Sensör izinleri zaten kurulu ($(UDEV_RULES)). Atlanıyor."; \
+	else \
+		echo "=> Sensör izinleri ayarlanıyor (udev kuralı)..."; \
+		printf '%s\n' \
+			'# $(BIN_NAME) — CPU/GPU güç ve sıcaklık sensörlerine kullanıcı erişimi' \
+			'# RAPL (CPU güç tüketimi — Intel ve AMD)' \
+			'SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/powercap/"' \
+			'# RAPL (CPU güç tüketimi — Intel ve AMD)' \
+			'SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/powercap/intel-rapl:0/"' \
+			'# hwmon (CPU/GPU sıcaklık sensörleri)' \
+			'SUBSYSTEM=="hwmon", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/hwmon/"' \
+			| sudo tee $(UDEV_RULES) > /dev/null; \
+		sudo chmod 0644 $(UDEV_RULES); \
+		sudo udevadm control --reload-rules; \
+		sudo udevadm trigger --subsystem-match=powercap; \
+		sudo udevadm trigger --subsystem-match=hwmon; \
+		echo "=> ✅ Sensör izinleri aktif."; \
+	fi
 
 # ── Geliştirme: direkt çalıştır ───────────────────────────────────────────────
-# make permissions yapıldıktan sonra sudo gerekmez.
 run: build
+	@if [ ! -f "$(UDEV_RULES)" ]; then \
+		echo "⚠️  Sensör izinleri kurulu değil — güç değerleri 0.0 W görünebilir."; \
+		echo "   Düzeltmek için: make permissions"; \
+	fi
 	@echo "=> $(BIN_NAME) başlatılıyor..."
 	@./target/release/$(BIN_NAME)
 
