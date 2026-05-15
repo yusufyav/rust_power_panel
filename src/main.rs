@@ -2,8 +2,10 @@ use gtk4::prelude::*;
 use gtk4::{glib, Application, ApplicationWindow, Box as GtkBox, CssProvider, Label, Orientation};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use nvml_wrapper::Nvml;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Components, ProcessesToUpdate, System};
@@ -287,6 +289,7 @@ enum GpuBackend {
         hwmon_path: String,
         pdev: String,
         vcn_instances: u32,
+        device_path: String,
     },
     // Intel GPU (i915/xe sürücüsü)
     // Güç: RAPL uncore domain (entegre iGPU) veya hwmon energy1_input (ayrık Arc)
@@ -300,6 +303,30 @@ enum GpuBackend {
 
 // ── Veri yapıları ─────────────────────────────────────────────────────────────
 
+struct GpuData {
+    temp: f32,
+    watt: f32,
+    media_procs: Vec<(String, u32, u32)>,
+    kind: GpuKind,
+    vram_used_mb: u32,
+    vram_total_mb: u32,
+    gfx_percent: u32,
+}
+
+impl Default for GpuData {
+    fn default() -> Self {
+        Self {
+            temp: 0.0,
+            watt: 0.0,
+            media_procs: Vec::new(),
+            kind: GpuKind::default(),
+            vram_used_mb: 0,
+            vram_total_mb: 0,
+            gfx_percent: 0,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct SensorData {
     cpu_temp: f32,
@@ -308,6 +335,9 @@ struct SensorData {
     gpu_watt: f32,
     media_procs: Vec<(String, u32, u32)>,
     gpu_kind: GpuKind,
+    vram_used_mb: u32,
+    vram_total_mb: u32,
+    gpu_gfx_percent: u32,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -460,7 +490,7 @@ fn run_cli_mode() {
             };
 
             // GPU verilerini al
-            let (gpu_temp, gpu_watt, media_procs, _) = read_gpu_data(
+            let gpu = read_gpu_data(
                 &gpu_backend,
                 &mut sys,
                 &mut intel_gpu_tracker,
@@ -470,15 +500,19 @@ fn run_cli_mode() {
 
             // Ekranı temizle ve yazdır
             print!("\x1B[2J\x1B[1;1H"); // ANSI clear screen
-            println!("⚡ TOPLAM: {:.1} W", cpu_watt + gpu_watt);
+            println!("⚡ TOPLAM: {:.1} W", cpu_watt + gpu.watt);
             println!();
             println!(" CPU: {:.1} W  │  {} °C", cpu_watt, cpu_temp.floor() as u32);
-            println!("󰢮 GPU: {:.1} W  │  {} °C", gpu_watt, gpu_temp.floor() as u32);
-            
-            if !media_procs.is_empty() {
+            println!("󰢮 GPU: {:.1} W  │  {} °C", gpu.watt, gpu.temp.floor() as u32);
+            if gpu.vram_total_mb > 0 {
+                println!("   VRAM: {} / {} MB   GFX: {}%",
+                    gpu.vram_used_mb, gpu.vram_total_mb, gpu.gfx_percent);
+            }
+
+            if !gpu.media_procs.is_empty() {
                 println!();
                 println!("Media Engines:");
-                for (name, dec, enc) in media_procs.iter().take(3) {
+                for (name, dec, enc) in gpu.media_procs.iter().take(3) {
                     println!("  {:<14}  DEC: {:>3}%  ENC: {:>3}%", name, dec, enc);
                 }
             }
@@ -495,20 +529,25 @@ fn read_gpu_data(
     intel_gpu_tracker: &mut Option<GpuPowerTracker>,
     amd_fdinfo_tracker: &mut Option<FdInfoTracker>,
     intel_fdinfo_tracker: &mut Option<IntelFdInfoTracker>,
-) -> (f32, f32, Vec<(String, u32, u32)>, GpuKind) {
-    let mut gpu_temp = 0.0f32;
-    let mut gpu_watt = 0.0f32;
-    let mut media_procs = Vec::new();
-    let mut gpu_kind = GpuKind::Unknown;
+) -> GpuData {
+    let mut data = GpuData::default();
 
     match gpu_backend {
         GpuBackend::Nvidia(nvml) => {
-            gpu_kind = GpuKind::Nvidia;
+            data.kind = GpuKind::Nvidia;
             if let Ok(dev) = nvml.device_by_index(0) {
-                gpu_watt = dev.power_usage().unwrap_or(0) as f32 / 1000.0;
-                gpu_temp = dev
+                data.watt = dev.power_usage().unwrap_or(0) as f32 / 1000.0;
+                data.temp = dev
                     .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
                     .unwrap_or(0) as f32;
+
+                if let Ok(mem) = dev.memory_info() {
+                    data.vram_used_mb = (mem.used / 1_048_576) as u32;
+                    data.vram_total_mb = (mem.total / 1_048_576) as u32;
+                }
+                if let Ok(util) = dev.utilization_rates() {
+                    data.gfx_percent = util.gpu;
+                }
 
                 let total_dec = dev.decoder_utilization().map(|u| u.utilization).unwrap_or(0);
                 let total_enc = dev.encoder_utilization().map(|u| u.utilization).unwrap_or(0);
@@ -533,36 +572,43 @@ fn read_gpu_data(
                                 .process(sysinfo::Pid::from(pid as usize))
                                 .map(|p| p.name().to_string_lossy().into_owned())
                                 .unwrap_or_else(|| format!("pid:{}", pid));
-                            media_procs.push((name, dec, enc));
+                            data.media_procs.push((name, dec, enc));
                         }
-                        media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+                        data.media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
                     }
                 }
             }
         }
-        GpuBackend::Amd { hwmon_path, .. } => {
-            gpu_kind = GpuKind::Amd;
+        GpuBackend::Amd { hwmon_path, device_path, .. } => {
+            data.kind = GpuKind::Amd;
             if let Ok(v) = read_u64(&format!("{}/temp1_input", hwmon_path)) {
-                gpu_temp = v as f32 / 1000.0;
+                data.temp = v as f32 / 1000.0;
             }
             if let Ok(v) = read_u64(&format!("{}/power1_average", hwmon_path)) {
-                gpu_watt = v as f32 / 1_000_000.0;
+                data.watt = v as f32 / 1_000_000.0;
+            }
+            if let Ok(used) = read_u64(&format!("{}/mem_info_vram_used", device_path)) {
+                data.vram_used_mb = (used / 1_048_576) as u32;
+            }
+            if let Ok(total) = read_u64(&format!("{}/mem_info_vram_total", device_path)) {
+                data.vram_total_mb = (total / 1_048_576) as u32;
+            }
+            if let Ok(gfx) = read_u64(&format!("{}/gpu_busy_percent", device_path)) {
+                data.gfx_percent = gfx as u32;
             }
             if let Some(tracker) = amd_fdinfo_tracker {
                 let info = tracker.sample();
-                media_procs = info.media_procs;
+                data.media_procs = info.media_procs;
             }
         }
         GpuBackend::Intel { hwmon_path, rapl_uncore_path } => {
-            gpu_kind = GpuKind::Intel;
-            // Sıcaklık (Arc GPU)
+            data.kind = GpuKind::Intel;
             if let Some(ref path) = hwmon_path {
                 if let Ok(v) = read_u64(&format!("{}/temp1_input", path)) {
-                    gpu_temp = v as f32 / 1000.0;
+                    data.temp = v as f32 / 1000.0;
                 }
             }
 
-            // Güç: önce RAPL uncore (entegre iGPU), sonra hwmon (Arc)
             if let Some(ref rapl_path) = rapl_uncore_path {
                 if let Ok(current_e) = read_u64(rapl_path) {
                     let now_t = Instant::now();
@@ -572,7 +618,7 @@ fn read_gpu_data(
                             let delta = current_e.saturating_sub(gpt.last_energy);
                             let w = delta as f32 / elapsed / 1_000_000.0;
                             if w > 0.1 && w < 100.0 {
-                                gpu_watt = w;
+                                data.watt = w;
                             }
                         }
                         gpt.last_energy = current_e;
@@ -585,7 +631,6 @@ fn read_gpu_data(
                     }
                 }
             } else if let Some(ref path) = hwmon_path {
-                // Fallback: Arc GPU hwmon
                 let energy_path = format!("{}/energy1_input", path);
                 if let Ok(current_e) = read_u64(&energy_path) {
                     let now_t = Instant::now();
@@ -595,7 +640,7 @@ fn read_gpu_data(
                             let delta = current_e.saturating_sub(gpt.last_energy);
                             let w = delta as f32 / elapsed / 1_000_000.0;
                             if w > 0.5 && w < 300.0 {
-                                gpu_watt = w;
+                                data.watt = w;
                             }
                         }
                         gpt.last_energy = current_e;
@@ -609,16 +654,15 @@ fn read_gpu_data(
                 }
             }
 
-            // Decode/Encode
             if let Some(tracker) = intel_fdinfo_tracker {
                 let info = tracker.sample();
-                media_procs = info.media_procs;
+                data.media_procs = info.media_procs;
             }
         }
         GpuBackend::None => {}
     }
 
-    (gpu_temp, gpu_watt, media_procs, gpu_kind)
+    data
 }
 
 // ── DIAGNOSTICS (TEŞHİS) MOTORU V4 (Sudo Korumalı) ───────────────
@@ -761,6 +805,27 @@ fn detect_cpu_temp_path() -> Option<String> {
 
     best_path
 }
+// ── UI helpers ───────────────────────────────────────────────────────────────
+
+struct DisplayState {
+    cpu_watt: f32,
+    gpu_watt: f32,
+    vram_mb: f32,
+    gfx_pct: f32,
+}
+
+impl Default for DisplayState {
+    fn default() -> Self {
+        Self { cpu_watt: 0.0, gpu_watt: 0.0, vram_mb: 0.0, gfx_pct: 0.0 }
+    }
+}
+
+fn temp_css_class(temp: f32) -> &'static str {
+    if temp >= 80.0 { "val-temp-hot" }
+    else if temp >= 60.0 { "val-temp-warm" }
+    else { "val-temp-cool" }
+}
+
 // ── UI ────────────────────────────────────────────────────────────────────────
 
 fn build_ui(app: &Application) {
@@ -813,6 +878,22 @@ fn build_ui(app: &Application) {
             color: #ff4757; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 16px;
         }
+        .val-temp-cool {
+            color: #4cd964; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 16px;
+        }
+        .val-temp-warm {
+            color: #ff9f43; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 16px;
+        }
+        .val-temp-hot {
+            color: #ff4757; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 16px;
+        }
+        .val-vram {
+            color: #74b9ff; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 14px;
+        }
         .val-proc {
             color: #b2bec3; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 13px;
@@ -842,11 +923,15 @@ fn build_ui(app: &Application) {
     total_label.set_halign(gtk4::Align::Center);
     panel.append(&total_label);
 
-    let (cpu_row, cpu_watt_lbl, cpu_temp_lbl) = make_hw_row("", "CPU", "lbl-cpu");
+    let (cpu_row, cpu_watt_lbl, cpu_therm_lbl, cpu_temp_lbl) = make_hw_row("", "CPU", "lbl-cpu");
     panel.append(&cpu_row);
 
-    let (gpu_row, gpu_watt_lbl, gpu_temp_lbl) = make_hw_row("󰢮", "GPU", "lbl-gpu");
+    let (gpu_row, gpu_watt_lbl, gpu_therm_lbl, gpu_temp_lbl) = make_hw_row("󰢮", "GPU", "lbl-gpu");
     panel.append(&gpu_row);
+
+    let (vram_row, vram_lbl, gfx_lbl) = make_vram_row();
+    vram_row.set_visible(false);
+    panel.append(&vram_row);
 
     let sep = gtk4::Separator::new(Orientation::Horizontal);
     sep.add_css_class("divider");
@@ -973,7 +1058,7 @@ fn build_ui(app: &Application) {
                     0.0
                 };
 
-                let (gpu_temp, gpu_watt, media_procs, gpu_kind) = read_gpu_data(
+                let gpu = read_gpu_data(
                     &gpu_backend,
                     &mut sys,
                     &mut intel_gpu_tracker,
@@ -984,10 +1069,13 @@ fn build_ui(app: &Application) {
                 if let Ok(mut d) = data_writer.lock() {
                     d.cpu_temp = cpu_temp;
                     d.cpu_watt = cpu_watt;
-                    d.gpu_temp = gpu_temp;
-                    d.gpu_watt = gpu_watt;
-                    d.media_procs = media_procs;
-                    d.gpu_kind = gpu_kind;
+                    d.gpu_temp = gpu.temp;
+                    d.gpu_watt = gpu.watt;
+                    d.media_procs = gpu.media_procs;
+                    d.gpu_kind = gpu.kind;
+                    d.vram_used_mb = gpu.vram_used_mb;
+                    d.vram_total_mb = gpu.vram_total_mb;
+                    d.gpu_gfx_percent = gpu.gfx_percent;
                 }
 
                 tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -995,54 +1083,80 @@ fn build_ui(app: &Application) {
         });
     });
 
-    glib::timeout_add_local(Duration::from_millis(1000), move || {
-        if let Ok(d) = data.lock() {
-            total_label.set_text(&format!("⚡ {:>6.1} W", d.cpu_watt + d.gpu_watt));
+    let display_state = Rc::new(RefCell::new(DisplayState::default()));
 
-            cpu_watt_lbl.set_text(&format!("{:>6.1} W", d.cpu_watt));
-            cpu_temp_lbl.set_text(&format!("{:>3.0} °C", d.cpu_temp.floor()));
-            gpu_watt_lbl.set_text(&format!("{:>6.1} W", d.gpu_watt));
-            gpu_temp_lbl.set_text(&format!("{:>3.0} °C", d.gpu_temp.floor()));
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        let target = match data.lock() {
+            Ok(d) => d.clone(),
+            Err(_) => return glib::ControlFlow::Continue,
+        };
 
-            let valid_gpu = d.gpu_kind != GpuKind::Unknown;
+        let mut ds = display_state.borrow_mut();
+        const ALPHA: f32 = 0.25;
+        ds.cpu_watt += (target.cpu_watt - ds.cpu_watt) * ALPHA;
+        ds.gpu_watt += (target.gpu_watt - ds.gpu_watt) * ALPHA;
+        ds.vram_mb  += (target.vram_used_mb as f32 - ds.vram_mb) * ALPHA;
+        ds.gfx_pct  += (target.gpu_gfx_percent as f32 - ds.gfx_pct) * ALPHA;
 
-            if valid_gpu && !d.media_procs.is_empty() {
-                media_container.set_visible(true);
-                let procs_str = d
-                    .media_procs
-                    .iter()
-                    .map(|(n, _, _)| {
-                        let text = n.chars().take(14).collect::<String>();
-                        if n.chars().count() > 14 {
-                            format!("{}…", text)
-                        } else {
-                            text
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let dec_str = d
-                    .media_procs
-                    .iter()
-                    .map(|(_, dec, _)| format!("{:>3} %", dec))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let enc_str = d
-                    .media_procs
-                    .iter()
-                    .map(|(_, _, enc)| format!("{:>3} %", enc))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+        total_label.set_text(&format!("⚡ {:>6.1} W", ds.cpu_watt + ds.gpu_watt));
 
-                media_proc_lbl.set_text(&procs_str);
-                media_dec_lbl.set_text(&dec_str);
-                media_enc_lbl.set_text(&enc_str);
-            } else {
-                media_container.set_visible(false);
-            }
+        cpu_watt_lbl.set_text(&format!("{:>6.1} W", ds.cpu_watt));
+        let cpu_cls = temp_css_class(target.cpu_temp);
+        cpu_therm_lbl.set_css_classes(&[cpu_cls]);
+        cpu_temp_lbl.set_css_classes(&[cpu_cls]);
+        cpu_temp_lbl.set_text(&format!("{:>3.0} °C", target.cpu_temp.floor()));
 
-            sep.set_visible(valid_gpu && !d.media_procs.is_empty());
+        gpu_watt_lbl.set_text(&format!("{:>6.1} W", ds.gpu_watt));
+        let gpu_cls = temp_css_class(target.gpu_temp);
+        gpu_therm_lbl.set_css_classes(&[gpu_cls]);
+        gpu_temp_lbl.set_css_classes(&[gpu_cls]);
+        gpu_temp_lbl.set_text(&format!("{:>3.0} °C", target.gpu_temp.floor()));
+
+        let valid_gpu = target.gpu_kind != GpuKind::Unknown;
+
+        if valid_gpu && target.vram_total_mb > 0 {
+            vram_row.set_visible(true);
+            vram_lbl.set_text(&format!(
+                "{:>5}/{:>5} MB",
+                ds.vram_mb as u32, target.vram_total_mb
+            ));
+            gfx_lbl.set_text(&format!("{:>3}%", ds.gfx_pct as u32));
+        } else {
+            vram_row.set_visible(false);
         }
+
+        let has_media = valid_gpu && !target.media_procs.is_empty();
+        if has_media {
+            media_container.set_visible(true);
+            let procs_str = target
+                .media_procs
+                .iter()
+                .map(|(n, _, _)| {
+                    let text = n.chars().take(14).collect::<String>();
+                    if n.chars().count() > 14 { format!("{}…", text) } else { text }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let dec_str = target
+                .media_procs
+                .iter()
+                .map(|(_, dec, _)| format!("{:>3} %", dec))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let enc_str = target
+                .media_procs
+                .iter()
+                .map(|(_, _, enc)| format!("{:>3} %", enc))
+                .collect::<Vec<_>>()
+                .join("\n");
+            media_proc_lbl.set_text(&procs_str);
+            media_dec_lbl.set_text(&dec_str);
+            media_enc_lbl.set_text(&enc_str);
+        } else {
+            media_container.set_visible(false);
+        }
+
+        sep.set_visible(valid_gpu && (has_media || target.vram_total_mb > 0));
         glib::ControlFlow::Continue
     });
 }
@@ -1166,10 +1280,13 @@ fn detect_gpu() -> GpuBackend {
                     let has_temp = fs::metadata(format!("{}/temp1_input", hwmon_path)).is_ok();
                     let has_power = fs::metadata(format!("{}/power1_average", hwmon_path)).is_ok();
                     if has_temp || has_power {
+                        let device_path =
+                            format!("/sys/class/drm/card{}/device", card_idx);
                         return GpuBackend::Amd {
                             hwmon_path,
                             pdev,
                             vcn_instances,
+                            device_path,
                         };
                     }
                 }
@@ -1222,7 +1339,7 @@ fn read_u64(path: &str) -> Result<u64, std::io::Error> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label) {
+fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label, Label) {
     let row = GtkBox::new(Orientation::Horizontal, 0);
     let lbl_icon = Label::builder()
         .label(icon)
@@ -1244,13 +1361,13 @@ fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label) {
         .build();
     let lbl_therm = Label::builder()
         .label(" ")
-        .css_classes(vec!["val-temp".to_string()])
+        .css_classes(vec!["val-temp-cool".to_string()])
         .width_chars(3)
         .xalign(1.0)
         .build();
     let lbl_temp = Label::builder()
         .label("  0 °C")
-        .css_classes(vec!["val-temp".to_string()])
+        .css_classes(vec!["val-temp-cool".to_string()])
         .width_chars(6)
         .xalign(1.0)
         .build();
@@ -1259,7 +1376,41 @@ fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label) {
     row.append(&lbl_watt);
     row.append(&lbl_therm);
     row.append(&lbl_temp);
-    (row, lbl_watt, lbl_temp)
+    (row, lbl_watt, lbl_therm, lbl_temp)
+}
+
+
+fn make_vram_row() -> (GtkBox, Label, Label) {
+    let row = GtkBox::new(Orientation::Horizontal, 0);
+    let lbl_icon = Label::builder()
+        .label("\u{f048b}")
+        .css_classes(vec!["lbl-gpu".to_string()])
+        .width_chars(3)
+        .xalign(0.0)
+        .build();
+    let lbl_name = Label::builder()
+        .label("VRAM")
+        .css_classes(vec!["lbl-gpu".to_string()])
+        .hexpand(true)
+        .xalign(0.0)
+        .build();
+    let lbl_vram = Label::builder()
+        .label("0 / 0 MB")
+        .css_classes(vec!["val-vram".to_string()])
+        .width_chars(14)
+        .xalign(1.0)
+        .build();
+    let lbl_gfx = Label::builder()
+        .label("  0%")
+        .css_classes(vec!["val-pct".to_string()])
+        .width_chars(5)
+        .xalign(1.0)
+        .build();
+    row.append(&lbl_icon);
+    row.append(&lbl_name);
+    row.append(&lbl_vram);
+    row.append(&lbl_gfx);
+    (row, lbl_vram, lbl_gfx)
 }
 
 fn make_media_section() -> (GtkBox, Label, Label, Label) {
