@@ -2,30 +2,83 @@
 
 A blazing-fast, strictly native GTK4 layer-shell hardware monitor for modern Linux desktops (Wayland). Built with 100% Rust.
 
+Displays CPU/GPU power consumption, temperature, and video engine (DEC/ENC) utilization as a lightweight overlay pinned to the top-right of your screen.
+
 ## ✨ Features
-* **Zero C-Dependencies (for AMD):** Direct IP Discovery and sysfs reading for absolute accuracy matching `amdgpu_top`.
-* **Smart UI:** Dynamic, auto-hiding process tables. Only expands when video codecs (DEC/ENC) are active.
-* **Wayland Native:** Perfectly anchors to your screen using `gtk4-layer-shell`.
-* **Featherweight:** Minimal memory footprint with aggressive Rust optimizations.
 
-## 🚀 Quick Start (One Command)
+- **Multi-GPU support** — NVIDIA (NVML), AMD (hwmon + fdinfo VCN), Intel iGPU (RAPL) / Arc (hwmon)
+- **Accurate AMD DEC/ENC tracking** — `drm-client-id` deduplication matches `amdgpu_top` accuracy
+- **Intel video engine** — i915/xe `drm-engine-video` utilization via fdinfo
+- **Smart CPU sensor detection** — scored hwmon scanner picks the right sensor for AMD and Intel
+- **Dynamic UI** — media table auto-hides when no video activity, expands per-process when active
+- **Wayland native** — anchored overlay via `gtk4-layer-shell`, no X11 dependency
+- **Featherweight** — < 10 MB RAM, aggressive release profile (LTO, strip, panic=abort)
+- **CLI mode** — terminal output with 1-second refresh (`--cli`)
+- **Sensor diagnostics** — `--debug` flag prints hwmon/RAPL/GPU status and exits
 
-Just clone and make! The setup will automatically detect your distro (Arch, Debian/Ubuntu, Fedora), install the required GTK4 dependencies, compile the release binary, and run it.
+## 🚀 Quick Start
 
 ```bash
-git clone [https://github.com/yusufyav/rust_power_panel.git](https://github.com/yusufyav/rust_power_panel.git)
+git clone https://github.com/yusufyav/rust_power_panel.git
 cd rust_power_panel
 make
+```
 
-Manual Installation
-If you want to install it system-wide after testing:
+The `make` command auto-detects your distro, installs GTK4 dependencies if missing, and compiles a release binary.
 
+## 📦 Installation
+
+```bash
 make install
+```
 
+Copies the binary to `/usr/local/bin/power_panel` and sets up udev rules so sensors are readable without `sudo`.
 
-🛠️ Stack
-Rust (Standard environment)
+To uninstall:
 
-GTK4 + gtk4-layer-shell
+```bash
+make uninstall
+```
 
-Nerd Fonts (Required for icons like 󰻠, 󰢮, )
+## ⌨️ KDE Plasma Keyboard Shortcut
+
+After `make install`, bind the following toggle command to a shortcut:
+
+```
+System Settings → Shortcuts → Custom Shortcuts → New → Global Shortcut → Command/URL
+```
+
+```bash
+bash -c 'pgrep -x power_panel && pkill -x power_panel || /usr/local/bin/power_panel'
+```
+
+Opens the panel if closed, closes it if open.
+
+## 🖥️ Usage
+
+```
+power_panel              # GUI overlay (default)
+power_panel --cli        # Terminal mode, updates every second
+power_panel --debug      # Print sensor diagnostics and exit
+power_panel --version    # Show version
+power_panel --help       # Show help
+```
+
+## 🛠️ Makefile Targets
+
+| Target | Description |
+|---|---|
+| `make` | Install deps + build |
+| `make run` | Build + run directly |
+| `make permissions` | Write udev rules for sensor access (one-time) |
+| `make install` | Install to `/usr/local/bin` |
+| `make uninstall` | Remove binary and udev rules |
+| `make clean` | Remove build artifacts |
+| `make help` | Show all targets |
+
+## 🔧 Stack
+
+- **Rust** — single `src/main.rs`, no unsafe
+- **GTK4** + **gtk4-layer-shell** — Wayland overlay
+- **nvml-wrapper** — NVIDIA power/temperature/process stats
+- **Nerd Fonts** — required for icons (`󰻠` CPU, `󰢮` GPU, `` thermometer)
