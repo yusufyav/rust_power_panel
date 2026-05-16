@@ -696,9 +696,12 @@ fn read_gpu_data(
                 }
                 data.media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
 
-                // CUDA → compute_procs (SM% if active, 0 if model loaded but idle)
+                // CUDA → compute_procs: only show processes with active SM% (not idle loaders)
                 for pid in &cuda_pids {
                     let sm = sm_by_pid.get(pid).copied().unwrap_or(0);
+                    if sm == 0 {
+                        continue;
+                    }
                     let name = sys
                         .process(sysinfo::Pid::from(*pid as usize))
                         .map(|p| p.name().to_string_lossy().into_owned())
