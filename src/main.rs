@@ -305,6 +305,7 @@ struct GpuData {
     temp: f32,
     watt: f32,
     media_procs: Vec<(String, u32, u32)>,
+    media_mode: MediaMode,
     kind: GpuKind,
     vram_used_mb: u32,
     vram_total_mb: u32,
@@ -317,6 +318,7 @@ impl Default for GpuData {
             temp: 0.0,
             watt: 0.0,
             media_procs: Vec::new(),
+            media_mode: MediaMode::default(),
             kind: GpuKind::default(),
             vram_used_mb: 0,
             vram_total_mb: 0,
@@ -332,6 +334,7 @@ struct SensorData {
     gpu_temp: f32,
     gpu_watt: f32,
     media_procs: Vec<(String, u32, u32)>,
+    media_mode: MediaMode,
     gpu_kind: GpuKind,
     vram_used_mb: u32,
     vram_total_mb: u32,
@@ -345,6 +348,13 @@ enum GpuKind {
     Nvidia,
     Amd,
     Intel,
+}
+
+#[derive(Clone, Default, PartialEq)]
+enum MediaMode {
+    #[default]
+    Codec,   // DEC / ENC columns (AMD VCN, Intel video, NVIDIA NVDEC/NVENC)
+    Compute, // CUDA compute procs only (no SM% available)
 }
 
 struct PowerTracker {
@@ -581,6 +591,30 @@ fn read_gpu_data(
                 if data.gfx_percent == 0 {
                     if let Ok(util) = dev.utilization_rates() {
                         data.gfx_percent = util.gpu;
+                    }
+                }
+
+                // Show active CUDA compute processes even when SM% is unavailable (permission issue)
+                if data.media_procs.is_empty() {
+                    if let Ok(procs) = dev.running_compute_processes() {
+                        if !procs.is_empty() {
+                            sys.refresh_processes(ProcessesToUpdate::All, false);
+                            for p in &procs {
+                                let vram_bytes = match p.used_gpu_memory {
+                                    nvml_wrapper::enums::device::UsedGpuMemory::Used(b) => b,
+                                    _ => 0,
+                                };
+                                if vram_bytes < 50 * 1024 * 1024 { continue; }
+                                let name = sys
+                                    .process(sysinfo::Pid::from(p.pid as usize))
+                                    .map(|proc| proc.name().to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| format!("pid:{}", p.pid));
+                                data.media_procs.push((name, 0, 0));
+                            }
+                            if !data.media_procs.is_empty() {
+                                data.media_mode = MediaMode::Compute;
+                            }
+                        }
                     }
                 }
             }
@@ -931,7 +965,7 @@ fn build_ui(app: &Application) {
     sep.set_visible(false);
     panel.append(&sep);
 
-    let (media_container, media_proc_lbl, media_dec_lbl, media_enc_lbl) = make_media_section();
+    let (media_container, media_proc_lbl, media_dec_lbl, media_enc_lbl, media_name_hdr, media_dec_hdr, media_enc_hdr) = make_media_section();
     media_container.set_visible(false);
     panel.append(&media_container);
 
@@ -1020,8 +1054,8 @@ fn build_ui(app: &Application) {
                     _ => {}
                 }
 
-                // Full sensor read every 5 ticks (~1000ms)
-                if loop_count % 5 == 0 {
+                // Full sensor read: immediately on first tick, then every 1000ms
+                if loop_count % 5 == 1 {
                     let cpu_temp = if let Some(ref path) = cpu_temp_path {
                         read_u64(path).map(|v| v as f32 / 1000.0).unwrap_or(0.0)
                     } else {
@@ -1088,9 +1122,17 @@ fn build_ui(app: &Application) {
                     gpu.gfx_percent = gpu.gfx_percent.max(gfx_max);
                     gfx_max = 0;
 
-                    // EMA smoothing: 20% new + 80% old each second
-                    cpu_watt_ema = cpu_watt_ema * 0.8 + cpu_watt_raw * 0.2;
-                    gpu_watt_ema = gpu_watt_ema * 0.8 + gpu.watt * 0.2;
+                    // EMA smoothing: initialize directly on first non-zero reading to avoid cold-start lag
+                    cpu_watt_ema = if cpu_watt_ema == 0.0 && cpu_watt_raw > 0.0 {
+                        cpu_watt_raw
+                    } else {
+                        cpu_watt_ema * 0.8 + cpu_watt_raw * 0.2
+                    };
+                    gpu_watt_ema = if gpu_watt_ema == 0.0 && gpu.watt > 0.0 {
+                        gpu.watt
+                    } else {
+                        gpu_watt_ema * 0.8 + gpu.watt * 0.2
+                    };
 
                     if let Ok(mut d) = data_writer.lock() {
                         d.cpu_temp = cpu_temp;
@@ -1098,6 +1140,7 @@ fn build_ui(app: &Application) {
                         d.gpu_temp = gpu.temp;
                         d.gpu_watt = gpu_watt_ema;
                         d.media_procs = gpu.media_procs;
+                        d.media_mode = gpu.media_mode;
                         d.gpu_kind = gpu.kind;
                         d.vram_used_mb = gpu.vram_used_mb;
                         d.vram_total_mb = gpu.vram_total_mb;
@@ -1146,6 +1189,13 @@ fn build_ui(app: &Application) {
         let has_media = valid_gpu && !target.media_procs.is_empty();
         if has_media {
             media_container.set_visible(true);
+            let is_compute = target.media_mode == MediaMode::Compute;
+            media_name_hdr.set_text(if is_compute { "CUDA" } else { "Process" });
+            media_dec_hdr.set_visible(!is_compute);
+            media_enc_hdr.set_visible(!is_compute);
+            media_dec_lbl.set_visible(!is_compute);
+            media_enc_lbl.set_visible(!is_compute);
+
             let procs_str = target
                 .media_procs
                 .iter()
@@ -1155,21 +1205,24 @@ fn build_ui(app: &Application) {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            let dec_str = target
-                .media_procs
-                .iter()
-                .map(|(_, dec, _)| format!("{:>3} %", dec))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let enc_str = target
-                .media_procs
-                .iter()
-                .map(|(_, _, enc)| format!("{:>3} %", enc))
-                .collect::<Vec<_>>()
-                .join("\n");
             media_proc_lbl.set_text(&procs_str);
-            media_dec_lbl.set_text(&dec_str);
-            media_enc_lbl.set_text(&enc_str);
+
+            if !is_compute {
+                let dec_str = target
+                    .media_procs
+                    .iter()
+                    .map(|(_, dec, _)| format!("{:>3} %", dec))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let enc_str = target
+                    .media_procs
+                    .iter()
+                    .map(|(_, _, enc)| format!("{:>3} %", enc))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                media_dec_lbl.set_text(&dec_str);
+                media_enc_lbl.set_text(&enc_str);
+            }
         } else {
             media_container.set_visible(false);
         }
@@ -1431,12 +1484,12 @@ fn make_vram_row() -> (GtkBox, Label, Label) {
     (row, lbl_vram, lbl_gfx)
 }
 
-fn make_media_section() -> (GtkBox, Label, Label, Label) {
+fn make_media_section() -> (GtkBox, Label, Label, Label, Label, Label, Label) {
     let container = GtkBox::new(Orientation::Vertical, 4);
 
     let header_row = GtkBox::new(Orientation::Horizontal, 0);
-    let lbl_name = Label::builder()
-        .label("Name")
+    let lbl_name_hdr = Label::builder()
+        .label("Process")
         .css_classes(vec!["lbl-util".to_string()])
         .hexpand(true)
         .xalign(0.0)
@@ -1453,7 +1506,7 @@ fn make_media_section() -> (GtkBox, Label, Label, Label) {
         .width_chars(6)
         .xalign(1.0)
         .build();
-    header_row.append(&lbl_name);
+    header_row.append(&lbl_name_hdr);
     header_row.append(&lbl_dec_hdr);
     header_row.append(&lbl_enc_hdr);
 
@@ -1485,5 +1538,5 @@ fn make_media_section() -> (GtkBox, Label, Label, Label) {
     container.append(&header_row);
     container.append(&data_row);
 
-    (container, lbl_proc, lbl_dec, lbl_enc)
+    (container, lbl_proc, lbl_dec, lbl_enc, lbl_name_hdr, lbl_dec_hdr, lbl_enc_hdr)
 }
