@@ -305,7 +305,7 @@ struct GpuData {
     temp: f32,
     watt: f32,
     media_procs: Vec<(String, u32, u32)>,
-    media_mode: MediaMode,
+    compute_procs: Vec<(String, u32)>,
     kind: GpuKind,
     vram_used_mb: u32,
     vram_total_mb: u32,
@@ -318,7 +318,7 @@ impl Default for GpuData {
             temp: 0.0,
             watt: 0.0,
             media_procs: Vec::new(),
-            media_mode: MediaMode::default(),
+            compute_procs: Vec::new(),
             kind: GpuKind::default(),
             vram_used_mb: 0,
             vram_total_mb: 0,
@@ -334,7 +334,7 @@ struct SensorData {
     gpu_temp: f32,
     gpu_watt: f32,
     media_procs: Vec<(String, u32, u32)>,
-    media_mode: MediaMode,
+    compute_procs: Vec<(String, u32)>,
     gpu_kind: GpuKind,
     vram_used_mb: u32,
     vram_total_mb: u32,
@@ -348,13 +348,6 @@ enum GpuKind {
     Nvidia,
     Amd,
     Intel,
-}
-
-#[derive(Clone, Default, PartialEq)]
-enum MediaMode {
-    #[default]
-    Codec,   // DEC / ENC columns (AMD VCN, Intel video, NVIDIA NVDEC/NVENC)
-    Compute, // CUDA compute procs only (no SM% available)
 }
 
 struct PowerTracker {
@@ -433,17 +426,138 @@ fn print_help() {
     println!("  • Düşük kaynak kullanımı (<10 MB RAM)");
 }
 
-fn run_cli_mode() {
+fn cli_row(plain: &str, colored: &str, w: usize) -> String {
+    let pad = w.saturating_sub(plain.chars().count());
+    format!("\x1B[2m│\x1B[0m {}{} \x1B[2m│\x1B[0m", colored, " ".repeat(pad))
+}
+
+fn cli_temp_color(t: f32) -> &'static str {
+    if t >= 80.0 { "\x1B[91m" } else if t >= 60.0 { "\x1B[93m" } else { "\x1B[92m" }
+}
+
+fn cli_titled_sep(title: &str, w: usize) -> String {
+    let inner = w + 2;
+    let prefix = format!("─── {} ", title);
+    let plen = prefix.chars().count();
+    let remaining = inner.saturating_sub(plen);
+    format!("\x1B[2m├{}{}┤\x1B[0m", prefix, "─".repeat(remaining))
+}
+
+fn render_cli_frame(cpu_watt: f32, cpu_temp: f32, gpu: &GpuData) {
     use std::io::{self, Write};
 
-    println!("🔌 PowerPanel CLI Modu - Çıkmak için Ctrl+C");
-    println!();
+    const W: usize = 38; // inner content width (between flanking spaces inside │)
 
+    // ANSI
+    const R:  &str = "\x1B[0m";
+    const BD: &str = "\x1B[1m";
+    const DM: &str = "\x1B[2m";
+    const CY: &str = "\x1B[96m";
+    const YL: &str = "\x1B[93m";
+    const GN: &str = "\x1B[92m";
+    const WH: &str = "\x1B[97m";
+    const BL: &str = "\x1B[94m";
+    const PR: &str = "\x1B[95m";
+
+    let top = format!("{DM}┌{}┐{R}", "─".repeat(W + 2));
+    let mid = format!("{DM}├{}┤{R}", "─".repeat(W + 2));
+    let bot = format!("{DM}└{}┘{R}", "─".repeat(W + 2));
+
+    let total = cpu_watt + gpu.watt;
+
+    print!("\x1B[2J\x1B[H");
+
+    // ── Title ─────────────────────────────────────────────────────────────────
+    // "PowerPanel" 10 + 21 spaces + "{:6.1}W" 7 = 38
+    let title_p = format!("PowerPanel{:<21}{:6.1}W", "", total);
+    let title_r = format!("{BD}{CY}PowerPanel{R}{:<21}{BD}{WH}{:6.1}W{R}", "", total);
+    println!("{top}");
+    println!("{}", cli_row(&title_p, &title_r, W));
+    println!("{mid}");
+
+    // ── CPU ───────────────────────────────────────────────────────────────────
+    // "CPU  " 5 + "{:6.1}W" 7 + "   " 3 + "{:3.0}°C" 5 = 20, pad 18
+    let cpu_tc = cli_temp_color(cpu_temp);
+    let cpu_p = format!("CPU  {:6.1}W   {:3.0}°C", cpu_watt, cpu_temp.floor());
+    let cpu_r = format!("{YL}CPU{R}  {WH}{:6.1}W{R}   {cpu_tc}{:3.0}°C{R}", cpu_watt, cpu_temp.floor());
+    println!("{}", cli_row(&cpu_p, &cpu_r, W));
+
+    // ── GPU ───────────────────────────────────────────────────────────────────
+    let gpu_tc = cli_temp_color(gpu.temp);
+    let gpu_p = format!("GPU  {:6.1}W   {:3.0}°C", gpu.watt, gpu.temp.floor());
+    let gpu_r = format!("{GN}GPU{R}  {WH}{:6.1}W{R}   {gpu_tc}{:3.0}°C{R}", gpu.watt, gpu.temp.floor());
+    println!("{}", cli_row(&gpu_p, &gpu_r, W));
+
+    // ── VRAM + GFX ────────────────────────────────────────────────────────────
+    if gpu.vram_total_mb > 0 {
+        // "VRAM  " 6 + "{:5}/{:5} MB" 13 + "  GFX " 6 + "{:3}%" 4 = 29, pad 9
+        let vram_p = format!("VRAM  {:5}/{:5} MB  GFX {:3}%",
+            gpu.vram_used_mb, gpu.vram_total_mb, gpu.gfx_percent);
+        let vram_r = format!("{DM}VRAM{R}  {BL}{:5}/{:5} MB{R}  {DM}GFX{R} {WH}{:3}%{R}",
+            gpu.vram_used_mb, gpu.vram_total_mb, gpu.gfx_percent);
+        println!("{}", cli_row(&vram_p, &vram_r, W));
+    }
+
+    // ── Video section ─────────────────────────────────────────────────────────
+    if !gpu.media_procs.is_empty() {
+        println!("{}", cli_titled_sep("Video", W));
+        let hdr_p = format!("{:<18} {:>5} {:>5}", "Process", "DEC", "ENC");
+        let hdr_r = format!("{DM}{:<18} {:>5} {:>5}{R}", "Process", "DEC", "ENC");
+        println!("{}", cli_row(&hdr_p, &hdr_r, W));
+        for (name, dec, enc) in gpu.media_procs.iter().take(4) {
+            let name_t: String = if name.chars().count() > 15 {
+                format!("{}…", name.chars().take(14).collect::<String>())
+            } else {
+                name.clone()
+            };
+            let proc_p = format!("  {:<16} {:>4}% {:>4}%", name_t, dec, enc);
+            let proc_r = format!("  {PR}{:<16}{R} {WH}{:>4}% {:>4}%{R}", name_t, dec, enc);
+            println!("{}", cli_row(&proc_p, &proc_r, W));
+        }
+    }
+
+    // ── CUDA section ──────────────────────────────────────────────────────────
+    if !gpu.compute_procs.is_empty() {
+        println!("{}", cli_titled_sep("CUDA", W));
+        let has_sm = gpu.compute_procs.iter().any(|(_, sm)| *sm > 0);
+        if has_sm {
+            let hdr_p = format!("{:<32} {:>5}", "CUDA", "SM%");
+            let hdr_r = format!("{DM}{:<32} {:>5}{R}", "CUDA", "SM%");
+            println!("{}", cli_row(&hdr_p, &hdr_r, W));
+            for (name, sm) in gpu.compute_procs.iter().take(4) {
+                let name_t: String = if name.chars().count() > 15 {
+                    format!("{}…", name.chars().take(14).collect::<String>())
+                } else {
+                    name.clone()
+                };
+                let proc_p = format!("  {:<30} {:>4}%", name_t, sm);
+                let proc_r = format!("  {PR}{:<30}{R} {WH}{:>4}%{R}", name_t, sm);
+                println!("{}", cli_row(&proc_p, &proc_r, W));
+            }
+        } else {
+            for (name, _) in gpu.compute_procs.iter().take(4) {
+                let name_t: String = if name.chars().count() > 15 {
+                    format!("{}…", name.chars().take(14).collect::<String>())
+                } else {
+                    name.clone()
+                };
+                let proc_p = format!("  {name_t}");
+                let proc_r = format!("  {PR}{name_t}{R}");
+                println!("{}", cli_row(&proc_p, &proc_r, W));
+            }
+        }
+    }
+
+    println!("{bot}");
+    io::stdout().flush().unwrap();
+}
+
+fn run_cli_mode() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let gpu_backend = detect_gpu();
         let mut sys = System::new();
-        
+
         let mut intel_gpu_tracker: Option<GpuPowerTracker> = None;
         let mut amd_fdinfo_tracker = match &gpu_backend {
             GpuBackend::Amd { pdev, vcn_instances, .. } => {
@@ -468,14 +582,12 @@ fn run_cli_mode() {
         let cpu_temp_path = detect_cpu_temp_path();
 
         loop {
-            // CPU Sıcaklık
             let cpu_temp = if let Some(ref path) = cpu_temp_path {
                 read_u64(path).map(|v| v as f32 / 1000.0).unwrap_or(0.0)
             } else {
                 0.0
             };
 
-            // CPU Güç
             let cpu_watt = if let Some(path) = cpu_tracker.path {
                 match read_u64(path) {
                     Ok(current) => {
@@ -497,7 +609,6 @@ fn run_cli_mode() {
                 0.0
             };
 
-            // GPU verilerini al
             let gpu = read_gpu_data(
                 &gpu_backend,
                 &mut sys,
@@ -506,26 +617,8 @@ fn run_cli_mode() {
                 &mut intel_fdinfo_tracker,
             );
 
-            // Ekranı temizle ve yazdır
-            print!("\x1B[2J\x1B[1;1H"); // ANSI clear screen
-            println!("⚡ TOPLAM: {:.1} W", cpu_watt + gpu.watt);
-            println!();
-            println!(" CPU: {:.1} W  │  {} °C", cpu_watt, cpu_temp.floor() as u32);
-            println!("󰢮 GPU: {:.1} W  │  {} °C", gpu.watt, gpu.temp.floor() as u32);
-            if gpu.vram_total_mb > 0 {
-                println!("   VRAM: {} / {} MB   GFX: {}%",
-                    gpu.vram_used_mb, gpu.vram_total_mb, gpu.gfx_percent);
-            }
+            render_cli_frame(cpu_watt, cpu_temp, &gpu);
 
-            if !gpu.media_procs.is_empty() {
-                println!();
-                println!("Media Engines:");
-                for (name, dec, enc) in gpu.media_procs.iter().take(3) {
-                    println!("  {:<14}  DEC: {:>3}%  ENC: {:>3}%", name, dec, enc);
-                }
-            }
-
-            io::stdout().flush().unwrap();
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     });
@@ -554,67 +647,70 @@ fn read_gpu_data(
                     data.vram_total_mb = (mem.total / 1_048_576) as u32;
                 }
 
-                // process_utilization_stats covers both compute (sm_util) and media (dec/enc)
+                // CUDA processes: running_compute_processes is CUDA-specific (not graphics/WebGPU)
+                let cuda_pids: std::collections::HashSet<u32> = dev
+                    .running_compute_processes()
+                    .map(|v| v.into_iter().map(|p| p.pid).collect())
+                    .unwrap_or_default();
+
+                let mut codec_map: HashMap<u32, (u32, u32)> = HashMap::new();
+                let mut sm_by_pid: HashMap<u32, u32> = HashMap::new();
+
                 if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
                     if !samples.is_empty() {
-                        // SM utilization sum = compute/GFX activity (covers LLM inference, etc.)
                         let sm_sum: u32 = samples.iter().map(|s| s.sm_util).sum();
                         data.gfx_percent = sm_sum.min(100);
 
-                        let has_media = samples.iter().any(|s| s.dec_util > 0 || s.enc_util > 0);
-                        if has_media {
-                            sys.refresh_processes(ProcessesToUpdate::All, false);
-                            let mut proc_map: HashMap<u32, (u32, u32)> = HashMap::new();
-                            for s in &samples {
-                                if s.dec_util > 0 || s.enc_util > 0 {
-                                    proc_map
-                                        .entry(s.pid)
-                                        .and_modify(|e| {
-                                            e.0 = e.0.max(s.dec_util);
-                                            e.1 = e.1.max(s.enc_util);
-                                        })
-                                        .or_insert((s.dec_util, s.enc_util));
-                                }
+                        for s in &samples {
+                            if s.dec_util > 0 || s.enc_util > 0 {
+                                codec_map
+                                    .entry(s.pid)
+                                    .and_modify(|e| {
+                                        e.0 = e.0.max(s.dec_util);
+                                        e.1 = e.1.max(s.enc_util);
+                                    })
+                                    .or_insert((s.dec_util, s.enc_util));
                             }
-                            for (pid, (dec, enc)) in proc_map {
-                                let name = sys
-                                    .process(sysinfo::Pid::from(pid as usize))
-                                    .map(|p| p.name().to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| format!("pid:{}", pid));
-                                data.media_procs.push((name, dec, enc));
+                            if s.sm_util > 0 {
+                                sm_by_pid
+                                    .entry(s.pid)
+                                    .and_modify(|e| *e = (*e).max(s.sm_util))
+                                    .or_insert(s.sm_util);
                             }
-                            data.media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
                         }
                     }
                 }
+
+                let needs_names = !codec_map.is_empty() || !cuda_pids.is_empty();
+                if needs_names {
+                    sys.refresh_processes(ProcessesToUpdate::All, false);
+                }
+
+                // Codec → media_procs (DEC/ENC), independent of CUDA
+                for (pid, (dec, enc)) in codec_map {
+                    let name = sys
+                        .process(sysinfo::Pid::from(pid as usize))
+                        .map(|p| p.name().to_string_lossy().into_owned())
+                        .unwrap_or_else(|| format!("pid:{}", pid));
+                    data.media_procs.push((name, dec, enc));
+                }
+                data.media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+
+                // CUDA → compute_procs (SM% if active, 0 if model loaded but idle)
+                for pid in &cuda_pids {
+                    let sm = sm_by_pid.get(pid).copied().unwrap_or(0);
+                    let name = sys
+                        .process(sysinfo::Pid::from(*pid as usize))
+                        .map(|p| p.name().to_string_lossy().into_owned())
+                        .unwrap_or_else(|| format!("pid:{}", pid));
+                    data.compute_procs.push((name, sm));
+                }
+                data.compute_procs.sort_by(|a, b| b.1.cmp(&a.1));
+
                 // Fallback: utilization_rates() if process stats returned nothing
                 if data.gfx_percent == 0 {
                     if let Ok(util) = dev.utilization_rates() {
                         data.gfx_percent = util.gpu;
-                    }
-                }
-
-                // Show active CUDA compute processes even when SM% is unavailable (permission issue)
-                if data.media_procs.is_empty() {
-                    if let Ok(procs) = dev.running_compute_processes() {
-                        if !procs.is_empty() {
-                            sys.refresh_processes(ProcessesToUpdate::All, false);
-                            for p in &procs {
-                                let vram_bytes = match p.used_gpu_memory {
-                                    nvml_wrapper::enums::device::UsedGpuMemory::Used(b) => b,
-                                    _ => 0,
-                                };
-                                if vram_bytes < 50 * 1024 * 1024 { continue; }
-                                let name = sys
-                                    .process(sysinfo::Pid::from(p.pid as usize))
-                                    .map(|proc| proc.name().to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| format!("pid:{}", p.pid));
-                                data.media_procs.push((name, 0, 0));
-                            }
-                            if !data.media_procs.is_empty() {
-                                data.media_mode = MediaMode::Compute;
-                            }
-                        }
                     }
                 }
             }
@@ -965,9 +1061,18 @@ fn build_ui(app: &Application) {
     sep.set_visible(false);
     panel.append(&sep);
 
-    let (media_container, media_proc_lbl, media_dec_lbl, media_enc_lbl, media_name_hdr, media_dec_hdr, media_enc_hdr) = make_media_section();
+    let (media_container, media_proc_lbl, media_dec_lbl, media_enc_lbl) = make_media_section();
     media_container.set_visible(false);
     panel.append(&media_container);
+
+    let compute_sep = gtk4::Separator::new(Orientation::Horizontal);
+    compute_sep.add_css_class("divider");
+    compute_sep.set_visible(false);
+    panel.append(&compute_sep);
+
+    let (compute_container, compute_proc_lbl, compute_sm_lbl, compute_sm_hdr) = make_compute_section();
+    compute_container.set_visible(false);
+    panel.append(&compute_container);
 
     window.set_child(Some(&panel));
 
@@ -1140,7 +1245,7 @@ fn build_ui(app: &Application) {
                         d.gpu_temp = gpu.temp;
                         d.gpu_watt = gpu_watt_ema;
                         d.media_procs = gpu.media_procs;
-                        d.media_mode = gpu.media_mode;
+                        d.compute_procs = gpu.compute_procs;
                         d.gpu_kind = gpu.kind;
                         d.vram_used_mb = gpu.vram_used_mb;
                         d.vram_total_mb = gpu.vram_total_mb;
@@ -1189,16 +1294,7 @@ fn build_ui(app: &Application) {
         let has_media = valid_gpu && !target.media_procs.is_empty();
         if has_media {
             media_container.set_visible(true);
-            let is_compute = target.media_mode == MediaMode::Compute;
-            media_name_hdr.set_text(if is_compute { "CUDA" } else { "Process" });
-            media_dec_hdr.set_visible(!is_compute);
-            media_enc_hdr.set_visible(!is_compute);
-            media_dec_lbl.set_visible(!is_compute);
-            media_enc_lbl.set_visible(!is_compute);
-
-            let procs_str = target
-                .media_procs
-                .iter()
+            let procs_str = target.media_procs.iter()
                 .map(|(n, _, _)| {
                     let text = n.chars().take(14).collect::<String>();
                     if n.chars().count() > 14 { format!("{}…", text) } else { text }
@@ -1206,28 +1302,44 @@ fn build_ui(app: &Application) {
                 .collect::<Vec<_>>()
                 .join("\n");
             media_proc_lbl.set_text(&procs_str);
-
-            if !is_compute {
-                let dec_str = target
-                    .media_procs
-                    .iter()
-                    .map(|(_, dec, _)| format!("{:>3} %", dec))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let enc_str = target
-                    .media_procs
-                    .iter()
-                    .map(|(_, _, enc)| format!("{:>3} %", enc))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                media_dec_lbl.set_text(&dec_str);
-                media_enc_lbl.set_text(&enc_str);
-            }
+            let dec_str = target.media_procs.iter()
+                .map(|(_, dec, _)| format!("{:>3} %", dec))
+                .collect::<Vec<_>>().join("\n");
+            let enc_str = target.media_procs.iter()
+                .map(|(_, _, enc)| format!("{:>3} %", enc))
+                .collect::<Vec<_>>().join("\n");
+            media_dec_lbl.set_text(&dec_str);
+            media_enc_lbl.set_text(&enc_str);
         } else {
             media_container.set_visible(false);
         }
 
-        sep.set_visible(valid_gpu && (has_media || target.vram_total_mb > 0));
+        let has_compute = valid_gpu && !target.compute_procs.is_empty();
+        if has_compute {
+            compute_container.set_visible(true);
+            let has_sm = target.compute_procs.iter().any(|(_, sm)| *sm > 0);
+            compute_sm_hdr.set_visible(has_sm);
+            compute_sm_lbl.set_visible(has_sm);
+            let procs_str = target.compute_procs.iter()
+                .map(|(n, _)| {
+                    let text = n.chars().take(14).collect::<String>();
+                    if n.chars().count() > 14 { format!("{}…", text) } else { text }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            compute_proc_lbl.set_text(&procs_str);
+            if has_sm {
+                let sm_str = target.compute_procs.iter()
+                    .map(|(_, sm)| format!("{:>3} %", sm))
+                    .collect::<Vec<_>>().join("\n");
+                compute_sm_lbl.set_text(&sm_str);
+            }
+        } else {
+            compute_container.set_visible(false);
+        }
+
+        compute_sep.set_visible(has_media && has_compute);
+        sep.set_visible(valid_gpu && (has_media || has_compute || target.vram_total_mb > 0));
         glib::ControlFlow::Continue
     });
 }
@@ -1484,12 +1596,12 @@ fn make_vram_row() -> (GtkBox, Label, Label) {
     (row, lbl_vram, lbl_gfx)
 }
 
-fn make_media_section() -> (GtkBox, Label, Label, Label, Label, Label, Label) {
+fn make_media_section() -> (GtkBox, Label, Label, Label) {
     let container = GtkBox::new(Orientation::Vertical, 4);
 
     let header_row = GtkBox::new(Orientation::Horizontal, 0);
     let lbl_name_hdr = Label::builder()
-        .label("Process")
+        .label("Video")
         .css_classes(vec!["lbl-util".to_string()])
         .hexpand(true)
         .xalign(0.0)
@@ -1538,5 +1650,48 @@ fn make_media_section() -> (GtkBox, Label, Label, Label, Label, Label, Label) {
     container.append(&header_row);
     container.append(&data_row);
 
-    (container, lbl_proc, lbl_dec, lbl_enc, lbl_name_hdr, lbl_dec_hdr, lbl_enc_hdr)
+    (container, lbl_proc, lbl_dec, lbl_enc)
+}
+
+fn make_compute_section() -> (GtkBox, Label, Label, Label) {
+    let container = GtkBox::new(Orientation::Vertical, 4);
+
+    let header_row = GtkBox::new(Orientation::Horizontal, 0);
+    let lbl_cuda_hdr = Label::builder()
+        .label("CUDA")
+        .css_classes(vec!["lbl-util".to_string()])
+        .hexpand(true)
+        .xalign(0.0)
+        .build();
+    let lbl_sm_hdr = Label::builder()
+        .label("SM%")
+        .css_classes(vec!["lbl-util".to_string()])
+        .width_chars(6)
+        .xalign(1.0)
+        .build();
+    header_row.append(&lbl_cuda_hdr);
+    header_row.append(&lbl_sm_hdr);
+
+    let data_row = GtkBox::new(Orientation::Horizontal, 0);
+    let lbl_proc = Label::builder()
+        .css_classes(vec!["val-proc".to_string()])
+        .hexpand(true)
+        .xalign(0.0)
+        .valign(gtk4::Align::Start)
+        .max_width_chars(16)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .build();
+    let lbl_sm = Label::builder()
+        .css_classes(vec!["val-pct".to_string()])
+        .width_chars(6)
+        .xalign(1.0)
+        .valign(gtk4::Align::Start)
+        .build();
+    data_row.append(&lbl_proc);
+    data_row.append(&lbl_sm);
+
+    container.append(&header_row);
+    container.append(&data_row);
+
+    (container, lbl_proc, lbl_sm, lbl_sm_hdr)
 }
