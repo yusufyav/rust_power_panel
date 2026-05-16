@@ -2,10 +2,8 @@ use gtk4::prelude::*;
 use gtk4::{glib, Application, ApplicationWindow, Box as GtkBox, CssProvider, Label, Orientation};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use nvml_wrapper::Nvml;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Components, ProcessesToUpdate, System};
@@ -815,17 +813,6 @@ fn detect_cpu_temp_path() -> Option<String> {
 }
 // ── UI helpers ───────────────────────────────────────────────────────────────
 
-struct DisplayState {
-    cpu_watt: f32,
-    gpu_watt: f32,
-}
-
-impl Default for DisplayState {
-    fn default() -> Self {
-        Self { cpu_watt: 0.0, gpu_watt: 0.0 }
-    }
-}
-
 fn temp_css_class(temp: f32) -> &'static str {
     if temp >= 80.0 { "val-temp-hot" }
     else if temp >= 60.0 { "val-temp-warm" }
@@ -1001,116 +988,143 @@ fn build_ui(app: &Application) {
             // CPU sıcaklık sensörünü kernel'den direkt okumak için
             let cpu_temp_path = detect_cpu_temp_path();
 
+            let mut loop_count: u32 = 0;
+            let mut gfx_max: u32 = 0;
+            let mut cpu_watt_ema: f32 = 0.0;
+            let mut gpu_watt_ema: f32 = 0.0;
+
             loop {
-                // CPU sıcaklık: direkt kernel'den oku (hem AMD hem Intel için daha güvenilir)
-                let cpu_temp = if let Some(ref path) = cpu_temp_path {
-                    read_u64(path).map(|v| v as f32 / 1000.0).unwrap_or(0.0)
-                } else {
-                    // Fallback: sysinfo Components API
-                    comps.refresh(false);
-                    let mut temp = 0.0f32;
-                    let mut found_die = false;
-                    for c in &comps {
-                        let lbl = c.label().to_lowercase();
-                        if lbl == "tdie" {
-                            if let Some(t) = c.temperature() {
-                                temp = t;
-                                found_die = true;
-                                break;
+                loop_count += 1;
+
+                // Quick GFX sample every 200ms — catches bursts that 1s polling misses
+                match &gpu_backend {
+                    GpuBackend::Nvidia(nvml) => {
+                        if let Ok(dev) = nvml.device_by_index(0) {
+                            if let Ok(util) = dev.utilization_rates() {
+                                gfx_max = gfx_max.max(util.gpu);
+                            }
+                            if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
+                                let sm: u32 = samples.iter()
+                                    .map(|s| s.sm_util)
+                                    .sum::<u32>()
+                                    .min(100);
+                                gfx_max = gfx_max.max(sm);
                             }
                         }
                     }
-                    if !found_die {
+                    GpuBackend::Amd { device_path, .. } => {
+                        if let Ok(v) = read_u64(&format!("{}/gpu_busy_percent", device_path)) {
+                            gfx_max = gfx_max.max(v as u32);
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Full sensor read every 5 ticks (~1000ms)
+                if loop_count % 5 == 0 {
+                    let cpu_temp = if let Some(ref path) = cpu_temp_path {
+                        read_u64(path).map(|v| v as f32 / 1000.0).unwrap_or(0.0)
+                    } else {
+                        comps.refresh(false);
+                        let mut temp = 0.0f32;
+                        let mut found_die = false;
                         for c in &comps {
                             let lbl = c.label().to_lowercase();
-                            if lbl == "tctl" 
-                                || lbl.contains("k10") 
-                                || lbl.contains("composite")
-                                || lbl.contains("package") 
-                            {
+                            if lbl == "tdie" {
                                 if let Some(t) = c.temperature() {
-                                    if t > temp {
-                                        temp = t;
+                                    temp = t;
+                                    found_die = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !found_die {
+                            for c in &comps {
+                                let lbl = c.label().to_lowercase();
+                                if lbl == "tctl"
+                                    || lbl.contains("k10")
+                                    || lbl.contains("composite")
+                                    || lbl.contains("package")
+                                {
+                                    if let Some(t) = c.temperature() {
+                                        if t > temp { temp = t; }
                                     }
                                 }
                             }
                         }
-                    }
-                    temp
-                };
+                        temp
+                    };
 
-                let cpu_watt = if let Some(path) = tracker.path {
-                    match read_u64(path) {
-                        Ok(current) => {
-                            let now = Instant::now();
-                            let elapsed = now.duration_since(tracker.last_time).as_secs_f32();
-                            let watts = if elapsed > 0.1 {
-                                let diff = current.saturating_sub(tracker.last_energy);
-                                (diff as f32 / elapsed) / 1_000_000.0
-                            } else {
-                                0.0
-                            };
-                            tracker.last_energy = current;
-                            tracker.last_time = now;
-                            if watts > 1.0 && watts < 400.0 {
-                                watts
-                            } else {
-                                0.0
+                    let cpu_watt_raw = if let Some(path) = tracker.path {
+                        match read_u64(path) {
+                            Ok(current) => {
+                                let now = Instant::now();
+                                let elapsed = now.duration_since(tracker.last_time).as_secs_f32();
+                                let watts = if elapsed > 0.1 {
+                                    let diff = current.saturating_sub(tracker.last_energy);
+                                    (diff as f32 / elapsed) / 1_000_000.0
+                                } else {
+                                    0.0
+                                };
+                                tracker.last_energy = current;
+                                tracker.last_time = now;
+                                if watts > 1.0 && watts < 400.0 { watts } else { 0.0 }
                             }
+                            Err(_) => 0.0,
                         }
-                        Err(_) => 0.0,
+                    } else {
+                        0.0
+                    };
+
+                    let mut gpu = read_gpu_data(
+                        &gpu_backend,
+                        &mut sys,
+                        &mut intel_gpu_tracker,
+                        &mut amd_fdinfo_tracker,
+                        &mut intel_fdinfo_tracker,
+                    );
+
+                    // Use max GFX seen over the last 5 ticks
+                    gpu.gfx_percent = gpu.gfx_percent.max(gfx_max);
+                    gfx_max = 0;
+
+                    // EMA smoothing: 20% new + 80% old each second
+                    cpu_watt_ema = cpu_watt_ema * 0.8 + cpu_watt_raw * 0.2;
+                    gpu_watt_ema = gpu_watt_ema * 0.8 + gpu.watt * 0.2;
+
+                    if let Ok(mut d) = data_writer.lock() {
+                        d.cpu_temp = cpu_temp;
+                        d.cpu_watt = cpu_watt_ema;
+                        d.gpu_temp = gpu.temp;
+                        d.gpu_watt = gpu_watt_ema;
+                        d.media_procs = gpu.media_procs;
+                        d.gpu_kind = gpu.kind;
+                        d.vram_used_mb = gpu.vram_used_mb;
+                        d.vram_total_mb = gpu.vram_total_mb;
+                        d.gpu_gfx_percent = gpu.gfx_percent;
                     }
-                } else {
-                    0.0
-                };
-
-                let gpu = read_gpu_data(
-                    &gpu_backend,
-                    &mut sys,
-                    &mut intel_gpu_tracker,
-                    &mut amd_fdinfo_tracker,
-                    &mut intel_fdinfo_tracker,
-                );
-
-                if let Ok(mut d) = data_writer.lock() {
-                    d.cpu_temp = cpu_temp;
-                    d.cpu_watt = cpu_watt;
-                    d.gpu_temp = gpu.temp;
-                    d.gpu_watt = gpu.watt;
-                    d.media_procs = gpu.media_procs;
-                    d.gpu_kind = gpu.kind;
-                    d.vram_used_mb = gpu.vram_used_mb;
-                    d.vram_total_mb = gpu.vram_total_mb;
-                    d.gpu_gfx_percent = gpu.gfx_percent;
                 }
 
-                tokio::time::sleep(Duration::from_millis(1000)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         });
     });
 
-    let display_state = Rc::new(RefCell::new(DisplayState::default()));
-
-    glib::timeout_add_local(Duration::from_millis(100), move || {
+    glib::timeout_add_local(Duration::from_millis(1000), move || {
         let target = match data.lock() {
             Ok(d) => d.clone(),
             Err(_) => return glib::ControlFlow::Continue,
         };
 
-        let mut ds = display_state.borrow_mut();
-        const ALPHA: f32 = 0.12;
-        ds.cpu_watt += (target.cpu_watt - ds.cpu_watt) * ALPHA;
-        ds.gpu_watt += (target.gpu_watt - ds.gpu_watt) * ALPHA;
+        total_label.set_text(&format!("⚡ {:>6.1} W", target.cpu_watt + target.gpu_watt));
 
-        total_label.set_text(&format!("⚡ {:>6.1} W", ds.cpu_watt + ds.gpu_watt));
-
-        cpu_watt_lbl.set_text(&format!("{:>6.1} W", ds.cpu_watt));
+        cpu_watt_lbl.set_text(&format!("{:>6.1} W", target.cpu_watt));
         let cpu_cls = temp_css_class(target.cpu_temp);
         cpu_therm_lbl.set_css_classes(&[cpu_cls]);
         cpu_temp_lbl.set_css_classes(&[cpu_cls]);
         cpu_temp_lbl.set_text(&format!("{:>3.0} °C", target.cpu_temp.floor()));
 
-        gpu_watt_lbl.set_text(&format!("{:>6.1} W", ds.gpu_watt));
+        gpu_watt_lbl.set_text(&format!("{:>6.1} W", target.gpu_watt));
         let gpu_cls = temp_css_class(target.gpu_temp);
         gpu_therm_lbl.set_css_classes(&[gpu_cls]);
         gpu_temp_lbl.set_css_classes(&[gpu_cls]);
