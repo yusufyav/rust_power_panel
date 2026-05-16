@@ -27,19 +27,21 @@ struct MediaInfo {
 struct FdInfoTracker {
     prev: HashMap<u64, (u64, u64, Instant)>,
     pdev: String,
+    vcn_instances: u32,
 }
 
 impl FdInfoTracker {
-    fn new(pdev: String) -> Self {
+    fn new(pdev: String, vcn_instances: u32) -> Self {
         Self {
             prev: HashMap::new(),
             pdev,
+            vcn_instances,
         }
     }
 
     fn sample(&mut self) -> MediaInfo {
         let now = Instant::now();
-        let mut current: HashMap<u64, (String, u64, u64)> = HashMap::new();
+        let mut current: HashMap<u64, (String, u64, u64, u32, u32)> = HashMap::new();
 
         let Ok(proc_dir) = fs::read_dir("/proc") else {
             return MediaInfo::default();
@@ -76,6 +78,8 @@ impl FdInfoTracker {
                 let mut client_id = None;
                 let mut fd_dec: u64 = 0;
                 let mut fd_enc: u64 = 0;
+                let mut cap_dec: u32 = 0;
+                let mut cap_enc: u32 = 0;
 
                 for line in content.lines() {
                     if line.starts_with("drm-client-id:") {
@@ -84,10 +88,16 @@ impl FdInfoTracker {
                         fd_dec = fd_dec.max(parse_fdinfo_ns(line));
                     } else if line.starts_with("drm-engine-enc:") {
                         fd_enc = fd_enc.max(parse_fdinfo_ns(line));
+                    } else if line.starts_with("drm-engine-capacity-dec:") {
+                        cap_dec = parse_fdinfo_ns(line) as u32;
+                    } else if line.starts_with("drm-engine-capacity-enc:") {
+                        cap_enc = parse_fdinfo_ns(line) as u32;
                     }
                 }
 
                 let cid = client_id.unwrap_or(pid as u64);
+                let final_cap_dec = if cap_dec > 0 { cap_dec } else { self.vcn_instances };
+                let final_cap_enc = if cap_enc > 0 { cap_enc } else { self.vcn_instances };
 
                 current
                     .entry(cid)
@@ -102,14 +112,14 @@ impl FdInfoTracker {
                                 .trim()
                                 .to_string();
                         }
-                        (proc_name.clone(), fd_dec, fd_enc)
+                        (proc_name.clone(), fd_dec, fd_enc, final_cap_dec, final_cap_enc)
                     });
             }
         }
 
         let mut media_list: Vec<(String, u32, u32)> = Vec::new();
 
-        for (cid, (name, dec_ns, enc_ns)) in &current {
+        for (cid, (name, dec_ns, enc_ns, cap_dec, cap_enc)) in &current {
             if let Some(&(prev_dec, prev_enc, prev_t)) = self.prev.get(cid) {
                 let elapsed = now.duration_since(prev_t).as_nanos() as u64;
                 if elapsed == 0 {
@@ -119,9 +129,8 @@ impl FdInfoTracker {
                 let dec_d = dec_ns.saturating_sub(prev_dec);
                 let enc_d = enc_ns.saturating_sub(prev_enc);
 
-                // Raw time ratio: matches amdgpu_top per-process display (no capacity division)
-                let dec_p = ((dec_d as f64 / elapsed as f64) * 100.0).min(100.0) as u32;
-                let enc_p = ((enc_d as f64 / elapsed as f64) * 100.0).min(100.0) as u32;
+                let dec_p = (((dec_d as f64 / elapsed as f64) * 100.0) as u32) / cap_dec;
+                let enc_p = (((enc_d as f64 / elapsed as f64) * 100.0) as u32) / cap_enc;
 
                 if dec_p > 0 || enc_p > 0 {
                     media_list.push((name.clone(), dec_p, enc_p));
@@ -130,7 +139,7 @@ impl FdInfoTracker {
         }
 
         self.prev.clear();
-        for (cid, (_, dec_ns, enc_ns)) in &current {
+        for (cid, (_, dec_ns, enc_ns, _, _)) in &current {
             self.prev.insert(*cid, (*dec_ns, *enc_ns, now));
         }
 
@@ -537,8 +546,8 @@ fn run_cli_mode() {
 
         let mut intel_gpu_tracker: Option<GpuPowerTracker> = None;
         let mut amd_fdinfo_tracker = match &gpu_backend {
-            GpuBackend::Amd { pdev, .. } => {
-                Some(FdInfoTracker::new(pdev.clone()))
+            GpuBackend::Amd { pdev, vcn_instances, .. } => {
+                Some(FdInfoTracker::new(pdev.clone(), *vcn_instances))
             }
             _ => None,
         };
@@ -1079,7 +1088,7 @@ fn build_ui(app: &Application) {
 
             let mut intel_gpu_tracker: Option<GpuPowerTracker> = None;
             let mut amd_fdinfo_tracker = match &gpu_backend {
-                GpuBackend::Amd { pdev, .. } => Some(FdInfoTracker::new(pdev.clone())),
+                GpuBackend::Amd { pdev, vcn_instances, .. } => Some(FdInfoTracker::new(pdev.clone(), *vcn_instances)),
                 _ => None,
             };
             let mut intel_fdinfo_tracker = match &gpu_backend {
