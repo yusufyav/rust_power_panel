@@ -21,11 +21,11 @@ fn parse_fdinfo_ns(line: &str) -> u64 {
 
 #[derive(Debug, Default, Clone)]
 struct MediaInfo {
-    media_procs: Vec<(String, u32, u32)>,
+    media_procs: Vec<(String, u32, u32, u32)>, // (name, dec%, enc%, gfx%)
 }
 
 struct FdInfoTracker {
-    prev: HashMap<u64, (u64, u64, Instant)>,
+    prev: HashMap<u64, (u64, u64, u64, Instant)>, // (dec_ns, enc_ns, gfx_ns, time)
     pdev: String,
     vcn_instances: u32,
 }
@@ -41,7 +41,7 @@ impl FdInfoTracker {
 
     fn sample(&mut self) -> MediaInfo {
         let now = Instant::now();
-        let mut current: HashMap<u64, (String, u64, u64, u32, u32)> = HashMap::new();
+        let mut current: HashMap<u64, (String, u64, u64, u64, u32, u32)> = HashMap::new();
 
         let Ok(proc_dir) = fs::read_dir("/proc") else {
             return MediaInfo::default();
@@ -78,6 +78,7 @@ impl FdInfoTracker {
                 let mut client_id = None;
                 let mut fd_dec: u64 = 0;
                 let mut fd_enc: u64 = 0;
+                let mut fd_gfx: u64 = 0;
                 let mut cap_dec: u32 = 0;
                 let mut cap_enc: u32 = 0;
 
@@ -88,6 +89,8 @@ impl FdInfoTracker {
                         fd_dec = fd_dec.max(parse_fdinfo_ns(line));
                     } else if line.starts_with("drm-engine-enc:") {
                         fd_enc = fd_enc.max(parse_fdinfo_ns(line));
+                    } else if line.starts_with("drm-engine-gfx:") {
+                        fd_gfx = fd_gfx.max(parse_fdinfo_ns(line));
                     } else if line.starts_with("drm-engine-capacity-dec:") {
                         cap_dec = parse_fdinfo_ns(line) as u32;
                     } else if line.starts_with("drm-engine-capacity-enc:") {
@@ -104,6 +107,7 @@ impl FdInfoTracker {
                     .and_modify(|e| {
                         e.1 = e.1.max(fd_dec);
                         e.2 = e.2.max(fd_enc);
+                        e.3 = e.3.max(fd_gfx);
                     })
                     .or_insert_with(|| {
                         if proc_name.is_empty() {
@@ -112,15 +116,15 @@ impl FdInfoTracker {
                                 .trim()
                                 .to_string();
                         }
-                        (proc_name.clone(), fd_dec, fd_enc, final_cap_dec, final_cap_enc)
+                        (proc_name.clone(), fd_dec, fd_enc, fd_gfx, final_cap_dec, final_cap_enc)
                     });
             }
         }
 
-        let mut media_list: Vec<(String, u32, u32)> = Vec::new();
+        let mut media_list: Vec<(String, u32, u32, u32)> = Vec::new();
 
-        for (cid, (name, dec_ns, enc_ns, cap_dec, cap_enc)) in &current {
-            if let Some(&(prev_dec, prev_enc, prev_t)) = self.prev.get(cid) {
+        for (cid, (name, dec_ns, enc_ns, gfx_ns, cap_dec, cap_enc)) in &current {
+            if let Some(&(prev_dec, prev_enc, prev_gfx, prev_t)) = self.prev.get(cid) {
                 let elapsed = now.duration_since(prev_t).as_nanos() as u64;
                 if elapsed == 0 {
                     continue;
@@ -128,22 +132,24 @@ impl FdInfoTracker {
 
                 let dec_d = dec_ns.saturating_sub(prev_dec);
                 let enc_d = enc_ns.saturating_sub(prev_enc);
+                let gfx_d = gfx_ns.saturating_sub(prev_gfx);
 
                 let dec_p = (((dec_d as f64 / elapsed as f64) * 100.0) as u32) / cap_dec;
                 let enc_p = (((enc_d as f64 / elapsed as f64) * 100.0) as u32) / cap_enc;
+                let gfx_p = ((gfx_d as f64 / elapsed as f64) * 100.0) as u32;
 
-                if dec_p > 0 || enc_p > 0 {
-                    media_list.push((name.clone(), dec_p, enc_p));
+                if dec_p > 0 || enc_p > 0 || gfx_p > 0 {
+                    media_list.push((name.clone(), dec_p, enc_p, gfx_p));
                 }
             }
         }
 
         self.prev.clear();
-        for (cid, (_, dec_ns, enc_ns, _, _)) in &current {
-            self.prev.insert(*cid, (*dec_ns, *enc_ns, now));
+        for (cid, (_, dec_ns, enc_ns, gfx_ns, _, _)) in &current {
+            self.prev.insert(*cid, (*dec_ns, *enc_ns, *gfx_ns, now));
         }
 
-        media_list.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+        media_list.sort_by(|a, b| (b.1 + b.2 + b.3).cmp(&(a.1 + a.2 + a.3)));
 
         MediaInfo {
             media_procs: media_list,
@@ -154,7 +160,7 @@ impl FdInfoTracker {
 // ── Intel fdinfo tracker ──────────────────────────────────────────────────────
 
 struct IntelFdInfoTracker {
-    prev: HashMap<u64, (u64, Instant)>,
+    prev: HashMap<u64, (u64, u64, Instant)>, // (video_ns, render_ns, time)
 }
 
 impl IntelFdInfoTracker {
@@ -166,7 +172,7 @@ impl IntelFdInfoTracker {
 
     fn sample(&mut self) -> MediaInfo {
         let now = Instant::now();
-        let mut current: HashMap<u64, (String, u64)> = HashMap::new();
+        let mut current: HashMap<u64, (String, u64, u64)> = HashMap::new();
 
         let Ok(proc_dir) = fs::read_dir("/proc") else {
             return MediaInfo::default();
@@ -200,17 +206,19 @@ impl IntelFdInfoTracker {
 
                 let mut client_id = None;
                 let mut video_ns: u64 = 0;
+                let mut render_ns: u64 = 0;
 
                 for line in content.lines() {
                     if line.starts_with("drm-client-id:") {
                         client_id = Some(parse_fdinfo_ns(line));
                     } else if line.starts_with("drm-engine-video:") {
-                        // Intel'de video engine decode+encode toplamını verir
                         video_ns = video_ns.max(parse_fdinfo_ns(line));
+                    } else if line.starts_with("drm-engine-render:") {
+                        render_ns = render_ns.max(parse_fdinfo_ns(line));
                     }
                 }
 
-                if video_ns == 0 {
+                if video_ns == 0 && render_ns == 0 {
                     continue;
                 }
 
@@ -220,6 +228,7 @@ impl IntelFdInfoTracker {
                     .entry(cid)
                     .and_modify(|e| {
                         e.1 = e.1.max(video_ns);
+                        e.2 = e.2.max(render_ns);
                     })
                     .or_insert_with(|| {
                         if proc_name.is_empty() {
@@ -228,33 +237,34 @@ impl IntelFdInfoTracker {
                                 .trim()
                                 .to_string();
                         }
-                        (proc_name.clone(), video_ns)
+                        (proc_name.clone(), video_ns, render_ns)
                     });
             }
         }
 
-        let mut media_list: Vec<(String, u32, u32)> = Vec::new();
+        let mut media_list: Vec<(String, u32, u32, u32)> = Vec::new();
 
-        for (cid, (name, video_ns)) in &current {
-            if let Some(&(prev_video, prev_t)) = self.prev.get(cid) {
+        for (cid, (name, video_ns, render_ns)) in &current {
+            if let Some(&(prev_video, prev_render, prev_t)) = self.prev.get(cid) {
                 let elapsed = now.duration_since(prev_t).as_nanos() as u64;
                 if elapsed == 0 {
                     continue;
                 }
 
                 let video_d = video_ns.saturating_sub(prev_video);
+                let render_d = render_ns.saturating_sub(prev_render);
                 let video_p = ((video_d as f64 / elapsed as f64) * 100.0) as u32;
+                let render_p = ((render_d as f64 / elapsed as f64) * 100.0) as u32;
 
-                if video_p > 0 {
-                    // Intel'de ayrı dec/enc yok, toplamı "DEC" sütununda göster
-                    media_list.push((name.clone(), video_p, 0));
+                if video_p > 0 || render_p > 0 {
+                    media_list.push((name.clone(), video_p, 0, render_p));
                 }
             }
         }
 
         self.prev.clear();
-        for (cid, (_, video_ns)) in &current {
-            self.prev.insert(*cid, (*video_ns, now));
+        for (cid, (_, video_ns, render_ns)) in &current {
+            self.prev.insert(*cid, (*video_ns, *render_ns, now));
         }
 
         media_list.sort_by(|a, b| b.1.cmp(&a.1));
@@ -290,7 +300,7 @@ enum GpuBackend {
 struct GpuData {
     temp: f32,
     watt: f32,
-    media_procs: Vec<(String, u32, u32)>,
+    media_procs: Vec<(String, u32, u32, u32)>, // (name, dec%, enc%, gfx%)
     compute_procs: Vec<(String, u32)>,
     kind: GpuKind,
     vram_used_mb: u32,
@@ -319,12 +329,14 @@ struct SensorData {
     cpu_watt: f32,
     gpu_temp: f32,
     gpu_watt: f32,
-    media_procs: Vec<(String, u32, u32)>,
+    media_procs: Vec<(String, u32, u32, u32)>, // (name, dec%, enc%, gfx%)
     compute_procs: Vec<(String, u32)>,
     gpu_kind: GpuKind,
     vram_used_mb: u32,
     vram_total_mb: u32,
     gpu_gfx_percent: u32,
+    ram_used_mb: u32,
+    ram_total_mb: u32,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -429,7 +441,7 @@ fn cli_titled_sep(title: &str, w: usize) -> String {
     format!("\x1B[2m├{}{}┤\x1B[0m", prefix, "─".repeat(remaining))
 }
 
-fn render_cli_frame(cpu_watt: f32, cpu_temp: f32, gpu: &GpuData) {
+fn render_cli_frame(cpu_watt: f32, cpu_temp: f32, gpu: &GpuData, ram_used_mb: u32, ram_total_mb: u32) {
     use std::io::{self, Write};
 
     const W: usize = 38; // inner content width (between flanking spaces inside │)
@@ -474,62 +486,78 @@ fn render_cli_frame(cpu_watt: f32, cpu_temp: f32, gpu: &GpuData) {
     let gpu_r = format!("{GN}GPU{R}  {WH}{:6.1}W{R}   {gpu_tc}{:3.0}°C{R}", gpu.watt, gpu.temp.floor());
     println!("{}", cli_row(&gpu_p, &gpu_r, W));
 
-    // ── VRAM + GFX ────────────────────────────────────────────────────────────
+    // ── RAM ───────────────────────────────────────────────────────────────────
+    if ram_total_mb > 0 {
+        let ram_pct = ram_used_mb * 100 / ram_total_mb;
+        let ram_uc = if ram_pct >= 90 { "\x1B[91m" } else if ram_pct >= 75 { "\x1B[93m" } else { "\x1B[92m" };
+        let ram_p = format!("RAM   {:>5}/{:>5} MB   ●{:>3}%", ram_used_mb, ram_total_mb, ram_pct);
+        let ram_r = format!("{YL}RAM{R}   {BL}{:>5}/{:>5} MB{R}   {ram_uc}●{:>3}%{R}", ram_used_mb, ram_total_mb, ram_pct);
+        println!("{}", cli_row(&ram_p, &ram_r, W));
+    }
+
+    // ── VRAM ──────────────────────────────────────────────────────────────────
     if gpu.vram_total_mb > 0 {
-        // "VRAM  " 6 + "{:5}/{:5} MB" 13 + "  GFX " 6 + "{:3}%" 4 = 29, pad 9
-        let vram_p = format!("VRAM  {:5}/{:5} MB  GFX {:3}%",
-            gpu.vram_used_mb, gpu.vram_total_mb, gpu.gfx_percent);
-        let vram_r = format!("{DM}VRAM{R}  {BL}{:5}/{:5} MB{R}  {DM}GFX{R} {WH}{:3}%{R}",
-            gpu.vram_used_mb, gpu.vram_total_mb, gpu.gfx_percent);
+        let vram_pct = gpu.vram_used_mb * 100 / gpu.vram_total_mb;
+        let vram_uc = if vram_pct >= 90 { "\x1B[91m" } else if vram_pct >= 75 { "\x1B[93m" } else { "\x1B[92m" };
+        let vram_p = format!("VRAM  {:>5}/{:>5} MB   ●{:>3}%", gpu.vram_used_mb, gpu.vram_total_mb, vram_pct);
+        let vram_r = format!("{GN}VRAM{R}  {BL}{:>5}/{:>5} MB{R}   {vram_uc}●{:>3}%{R}", gpu.vram_used_mb, gpu.vram_total_mb, vram_pct);
         println!("{}", cli_row(&vram_p, &vram_r, W));
     }
 
-    // ── Video section ─────────────────────────────────────────────────────────
-    if !gpu.media_procs.is_empty() {
-        println!("{}", cli_titled_sep("Video", W));
-        let hdr_p = format!("{:<18} {:>5} {:>5}", "Process", "DEC", "ENC");
-        let hdr_r = format!("{DM}{:<18} {:>5} {:>5}{R}", "Process", "DEC", "ENC");
-        println!("{}", cli_row(&hdr_p, &hdr_r, W));
-        for (name, dec, enc) in gpu.media_procs.iter().take(4) {
-            let name_t: String = if name.chars().count() > 15 {
-                format!("{}…", name.chars().take(14).collect::<String>())
+    // ── Process section (GFX / DEC / ENC / SM% combined) ─────────────────────
+    let has_compute = !gpu.compute_procs.is_empty();
+    if !gpu.media_procs.is_empty() || has_compute {
+        println!("{}", cli_titled_sep("Procs", W));
+
+        // combined: (name, gfx, dec, enc, sm)
+        let mut combined: Vec<(String, Option<u32>, Option<u32>, Option<u32>, Option<u32>)> = Vec::new();
+        for (name, dec, enc, gfx) in &gpu.media_procs {
+            let g = if *gfx > 0 { Some(*gfx) } else { None };
+            let d = if *dec > 0 { Some(*dec) } else { None };
+            let e = if *enc > 0 { Some(*enc) } else { None };
+            combined.push((name.clone(), g, d, e, None));
+        }
+        for (name, sm) in &gpu.compute_procs {
+            let s = if *sm > 0 { Some(*sm) } else { None };
+            if let Some(entry) = combined.iter_mut().find(|(n, ..)| n == name) {
+                entry.4 = s;
+                if entry.1.is_none() { entry.1 = s; }
+            } else {
+                combined.push((name.clone(), s, None, None, s));
+            }
+        }
+
+        let fmt_v = |v: Option<u32>| -> String {
+            match v {
+                Some(x) if x > 0 => format!("{:>4}%", x),
+                _ => "   —".to_string(),
+            }
+        };
+
+        if has_compute {
+            let hdr_p = format!("{:<12} {:>5} {:>5} {:>5} {:>5}", "Process", "GFX", "DEC", "ENC", "SM%");
+            let hdr_r = format!("{DM}{:<12} {:>5} {:>5} {:>5} {:>5}{R}", "Process", "GFX", "DEC", "ENC", "SM%");
+            println!("{}", cli_row(&hdr_p, &hdr_r, W));
+        } else {
+            let hdr_p = format!("{:<12} {:>5} {:>5} {:>5}", "Process", "GFX", "DEC", "ENC");
+            let hdr_r = format!("{DM}{:<12} {:>5} {:>5} {:>5}{R}", "Process", "GFX", "DEC", "ENC");
+            println!("{}", cli_row(&hdr_p, &hdr_r, W));
+        }
+
+        for (name, gfx, dec, enc, sm) in combined.iter().take(4) {
+            let name_t: String = if name.chars().count() > 11 {
+                format!("{}…", name.chars().take(10).collect::<String>())
             } else {
                 name.clone()
             };
-            let proc_p = format!("  {:<16} {:>4}% {:>4}%", name_t, dec, enc);
-            let proc_r = format!("  {PR}{:<16}{R} {WH}{:>4}% {:>4}%{R}", name_t, dec, enc);
-            println!("{}", cli_row(&proc_p, &proc_r, W));
-        }
-    }
-
-    // ── CUDA section ──────────────────────────────────────────────────────────
-    if !gpu.compute_procs.is_empty() {
-        println!("{}", cli_titled_sep("CUDA", W));
-        let has_sm = gpu.compute_procs.iter().any(|(_, sm)| *sm > 0);
-        if has_sm {
-            let hdr_p = format!("{:<32} {:>5}", "CUDA", "SM%");
-            let hdr_r = format!("{DM}{:<32} {:>5}{R}", "CUDA", "SM%");
-            println!("{}", cli_row(&hdr_p, &hdr_r, W));
-            for (name, sm) in gpu.compute_procs.iter().take(4) {
-                let name_t: String = if name.chars().count() > 15 {
-                    format!("{}…", name.chars().take(14).collect::<String>())
-                } else {
-                    name.clone()
-                };
-                let proc_p = format!("  {:<30} {:>4}%", name_t, sm);
-                let proc_r = format!("  {PR}{:<30}{R} {WH}{:>4}%{R}", name_t, sm);
-                println!("{}", cli_row(&proc_p, &proc_r, W));
-            }
-        } else {
-            for (name, _) in gpu.compute_procs.iter().take(4) {
-                let name_t: String = if name.chars().count() > 15 {
-                    format!("{}…", name.chars().take(14).collect::<String>())
-                } else {
-                    name.clone()
-                };
-                let proc_p = format!("  {name_t}");
-                let proc_r = format!("  {PR}{name_t}{R}");
-                println!("{}", cli_row(&proc_p, &proc_r, W));
+            if has_compute {
+                let row_p = format!("  {:<10} {:>5} {:>5} {:>5} {:>5}", name_t, fmt_v(*gfx), fmt_v(*dec), fmt_v(*enc), fmt_v(*sm));
+                let row_r = format!("  {PR}{:<10}{R} {WH}{:>5} {:>5} {:>5} {:>5}{R}", name_t, fmt_v(*gfx), fmt_v(*dec), fmt_v(*enc), fmt_v(*sm));
+                println!("{}", cli_row(&row_p, &row_r, W));
+            } else {
+                let row_p = format!("  {:<10} {:>5} {:>5} {:>5}", name_t, fmt_v(*gfx), fmt_v(*dec), fmt_v(*enc));
+                let row_r = format!("  {PR}{:<10}{R} {WH}{:>5} {:>5} {:>5}{R}", name_t, fmt_v(*gfx), fmt_v(*dec), fmt_v(*enc));
+                println!("{}", cli_row(&row_p, &row_r, W));
             }
         }
     }
@@ -603,7 +631,11 @@ fn run_cli_mode() {
                 &mut intel_fdinfo_tracker,
             );
 
-            render_cli_frame(cpu_watt, cpu_temp, &gpu);
+            sys.refresh_memory();
+            let ram_used_mb = (sys.used_memory() / 1_048_576) as u32;
+            let ram_total_mb = (sys.total_memory() / 1_048_576) as u32;
+
+            render_cli_frame(cpu_watt, cpu_temp, &gpu, ram_used_mb, ram_total_mb);
 
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
@@ -672,13 +704,14 @@ fn read_gpu_data(
                     sys.refresh_processes(ProcessesToUpdate::All, false);
                 }
 
-                // Codec → media_procs (DEC/ENC), independent of CUDA
+                // Codec → media_procs (DEC/ENC/GFX), independent of CUDA
                 for (pid, (dec, enc)) in codec_map {
                     let name = sys
                         .process(sysinfo::Pid::from(pid as usize))
                         .map(|p| p.name().to_string_lossy().into_owned())
                         .unwrap_or_else(|| format!("pid:{}", pid));
-                    data.media_procs.push((name, dec, enc));
+                    let gfx = sm_by_pid.get(&pid).copied().unwrap_or(0);
+                    data.media_procs.push((name, dec, enc, gfx));
                 }
                 data.media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
 
@@ -938,6 +971,12 @@ fn temp_css_class(temp: f32) -> &'static str {
     else { "val-temp-cool" }
 }
 
+fn usage_css_class(pct: u32) -> &'static str {
+    if pct >= 90 { "val-temp-hot" }
+    else if pct >= 75 { "val-temp-warm" }
+    else { "val-pct" }
+}
+
 // ── UI ────────────────────────────────────────────────────────────────────────
 
 fn build_ui(app: &Application) {
@@ -1002,6 +1041,10 @@ fn build_ui(app: &Application) {
             color: #ff4757; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 16px;
         }
+        .lbl-ram {
+            color: #00cec9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 16px; font-weight: bold;
+        }
         .val-vram {
             color: #74b9ff; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 14px;
@@ -1009,6 +1052,18 @@ fn build_ui(app: &Application) {
         .val-proc {
             color: #b2bec3; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
             font-size: 13px;
+        }
+        .proc-hdr {
+            color: #a29bfe; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 13px; font-weight: bold;
+        }
+        .proc-val {
+            color: #b2bec3; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }
+        .proc-num {
+            color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 12px;
         }
         .val-pct {
             color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
@@ -1041,7 +1096,10 @@ fn build_ui(app: &Application) {
     let (gpu_row, gpu_watt_lbl, gpu_therm_lbl, gpu_temp_lbl) = make_hw_row("󰢮", "GPU", "lbl-gpu");
     panel.append(&gpu_row);
 
-    let (vram_row, vram_lbl, gfx_lbl) = make_vram_row();
+    let (ram_row, ram_lbl, ram_pct_lbl) = make_ram_row();
+    panel.append(&ram_row);
+
+    let (vram_row, vram_lbl, vram_pct_lbl) = make_vram_row();
     vram_row.set_visible(false);
     panel.append(&vram_row);
 
@@ -1050,18 +1108,9 @@ fn build_ui(app: &Application) {
     sep.set_visible(false);
     panel.append(&sep);
 
-    let (media_container, media_proc_lbl, media_dec_lbl, media_enc_lbl) = make_media_section();
-    media_container.set_visible(false);
-    panel.append(&media_container);
-
-    let compute_sep = gtk4::Separator::new(Orientation::Horizontal);
-    compute_sep.add_css_class("divider");
-    compute_sep.set_visible(false);
-    panel.append(&compute_sep);
-
-    let (compute_container, compute_proc_lbl, compute_sm_lbl, compute_sm_hdr) = make_compute_section();
-    compute_container.set_visible(false);
-    panel.append(&compute_container);
+    let (proc_container, proc_lbl, gfx_lbl, dec_lbl, enc_lbl, sm_lbl) = make_process_section();
+    proc_container.set_visible(false);
+    panel.append(&proc_container);
 
     window.set_child(Some(&panel));
 
@@ -1224,6 +1273,10 @@ fn build_ui(app: &Application) {
                         gpu_watt_ema * 0.8 + gpu.watt * 0.2
                     };
 
+                    sys.refresh_memory();
+                    let ram_used_mb = (sys.used_memory() / 1_048_576) as u32;
+                    let ram_total_mb = (sys.total_memory() / 1_048_576) as u32;
+
                     if let Ok(mut d) = data_writer.lock() {
                         d.cpu_temp = cpu_temp;
                         d.cpu_watt = cpu_watt_ema;
@@ -1235,6 +1288,8 @@ fn build_ui(app: &Application) {
                         d.vram_used_mb = gpu.vram_used_mb;
                         d.vram_total_mb = gpu.vram_total_mb;
                         d.gpu_gfx_percent = gpu.gfx_percent;
+                        d.ram_used_mb = ram_used_mb;
+                        d.ram_total_mb = ram_total_mb;
                     }
                 }
 
@@ -1265,66 +1320,72 @@ fn build_ui(app: &Application) {
 
         let valid_gpu = target.gpu_kind != GpuKind::Unknown;
 
+        if target.ram_total_mb > 0 {
+            let ram_pct = target.ram_used_mb * 100 / target.ram_total_mb;
+            ram_lbl.set_text(&format!("{:>5}/{:>5} MB ", target.ram_used_mb, target.ram_total_mb));
+            ram_pct_lbl.set_css_classes(&[usage_css_class(ram_pct)]);
+            ram_pct_lbl.set_text(&format!("●{:>3}%", ram_pct));
+        }
+
         if valid_gpu && target.vram_total_mb > 0 {
             vram_row.set_visible(true);
-            vram_lbl.set_text(&format!(
-                "{:>5}/{:>5} MB",
-                target.vram_used_mb, target.vram_total_mb
-            ));
-            gfx_lbl.set_text(&format!("{:>3}%", target.gpu_gfx_percent));
+            vram_lbl.set_text(&format!("{:>5}/{:>5} MB ", target.vram_used_mb, target.vram_total_mb));
+            let vram_pct = target.vram_used_mb * 100 / target.vram_total_mb;
+            vram_pct_lbl.set_css_classes(&[usage_css_class(vram_pct)]);
+            vram_pct_lbl.set_text(&format!("●{:>3}%", vram_pct));
         } else {
             vram_row.set_visible(false);
         }
 
         let has_media = valid_gpu && !target.media_procs.is_empty();
-        if has_media {
-            media_container.set_visible(true);
-            let procs_str = target.media_procs.iter()
-                .map(|(n, _, _)| {
-                    let text = n.chars().take(14).collect::<String>();
-                    if n.chars().count() > 14 { format!("{}…", text) } else { text }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            media_proc_lbl.set_text(&procs_str);
-            let dec_str = target.media_procs.iter()
-                .map(|(_, dec, _)| format!("{:>3} %", dec))
-                .collect::<Vec<_>>().join("\n");
-            let enc_str = target.media_procs.iter()
-                .map(|(_, _, enc)| format!("{:>3} %", enc))
-                .collect::<Vec<_>>().join("\n");
-            media_dec_lbl.set_text(&dec_str);
-            media_enc_lbl.set_text(&enc_str);
-        } else {
-            media_container.set_visible(false);
-        }
-
         let has_compute = valid_gpu && !target.compute_procs.is_empty();
-        if has_compute {
-            compute_container.set_visible(true);
-            let has_sm = target.compute_procs.iter().any(|(_, sm)| *sm > 0);
-            compute_sm_hdr.set_visible(has_sm);
-            compute_sm_lbl.set_visible(has_sm);
-            let procs_str = target.compute_procs.iter()
-                .map(|(n, _)| {
-                    let text = n.chars().take(14).collect::<String>();
-                    if n.chars().count() > 14 { format!("{}…", text) } else { text }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            compute_proc_lbl.set_text(&procs_str);
-            if has_sm {
-                let sm_str = target.compute_procs.iter()
-                    .map(|(_, sm)| format!("{:>3} %", sm))
-                    .collect::<Vec<_>>().join("\n");
-                compute_sm_lbl.set_text(&sm_str);
+        let has_procs = has_media || has_compute;
+
+        if has_procs {
+            proc_container.set_visible(true);
+
+            // combined: (name, gfx, dec, enc, sm) — all Option<u32>
+            let mut combined: Vec<(String, Option<u32>, Option<u32>, Option<u32>, Option<u32>)> = Vec::new();
+            for (name, dec, enc, gfx) in &target.media_procs {
+                let gfx_v = if *gfx > 0 { Some(*gfx) } else { None };
+                let dec_v = if *dec > 0 { Some(*dec) } else { None };
+                let enc_v = if *enc > 0 { Some(*enc) } else { None };
+                combined.push((name.clone(), gfx_v, dec_v, enc_v, None));
             }
+            for (name, sm) in &target.compute_procs {
+                let sm_v = if *sm > 0 { Some(*sm) } else { None };
+                if let Some(entry) = combined.iter_mut().find(|(n, ..)| n == name) {
+                    entry.4 = sm_v;
+                    if entry.1.is_none() { entry.1 = sm_v; }
+                } else {
+                    combined.push((name.clone(), sm_v, None, None, sm_v));
+                }
+            }
+
+            let trunc = |n: &str| -> String {
+                if n.chars().count() > 11 {
+                    format!("{}…", n.chars().take(10).collect::<String>())
+                } else {
+                    n.to_string()
+                }
+            };
+            let fmt_val = |v: Option<u32>| -> String {
+                match v {
+                    Some(x) if x > 0 => format!("{:>3}%", x),
+                    _ => "  —".to_string(),
+                }
+            };
+
+            proc_lbl.set_text(&combined.iter().map(|(n, ..)| trunc(n)).collect::<Vec<_>>().join("\n"));
+            gfx_lbl.set_text(&combined.iter().map(|(_, g, ..)| fmt_val(*g)).collect::<Vec<_>>().join("\n"));
+            dec_lbl.set_text(&combined.iter().map(|(_, _, d, ..)| fmt_val(*d)).collect::<Vec<_>>().join("\n"));
+            enc_lbl.set_text(&combined.iter().map(|(_, _, _, e, _)| fmt_val(*e)).collect::<Vec<_>>().join("\n"));
+            sm_lbl.set_text(&combined.iter().map(|(_, _, _, _, s)| fmt_val(*s)).collect::<Vec<_>>().join("\n"));
         } else {
-            compute_container.set_visible(false);
+            proc_container.set_visible(false);
         }
 
-        compute_sep.set_visible(has_media && has_compute);
-        sep.set_visible(valid_gpu && (has_media || has_compute || target.vram_total_mb > 0));
+        sep.set_visible(valid_gpu && (has_procs || target.vram_total_mb > 0));
         glib::ControlFlow::Continue
     });
 }
@@ -1563,13 +1624,13 @@ fn make_vram_row() -> (GtkBox, Label, Label) {
         .xalign(0.0)
         .build();
     let lbl_vram = Label::builder()
-        .label("0 / 0 MB")
+        .label("    0/    0 MB ")
         .css_classes(vec!["val-vram".to_string()])
-        .width_chars(14)
+        .width_chars(15)
         .xalign(1.0)
         .build();
     let lbl_gfx = Label::builder()
-        .label("  0%")
+        .label("●  0%")
         .css_classes(vec!["val-pct".to_string()])
         .width_chars(5)
         .xalign(1.0)
@@ -1581,102 +1642,121 @@ fn make_vram_row() -> (GtkBox, Label, Label) {
     (row, lbl_vram, lbl_gfx)
 }
 
-fn make_media_section() -> (GtkBox, Label, Label, Label) {
+fn make_ram_row() -> (GtkBox, Label, Label) {
+    let row = GtkBox::new(Orientation::Horizontal, 0);
+    let lbl_icon = Label::builder()
+        .label("\u{f035b}")
+        .css_classes(vec!["lbl-ram".to_string()])
+        .width_chars(3)
+        .xalign(0.0)
+        .build();
+    let lbl_name = Label::builder()
+        .label("RAM")
+        .css_classes(vec!["lbl-ram".to_string()])
+        .hexpand(true)
+        .xalign(0.0)
+        .build();
+    let lbl_ram = Label::builder()
+        .label("    0/    0 MB ")
+        .css_classes(vec!["val-vram".to_string()])
+        .width_chars(15)
+        .xalign(1.0)
+        .build();
+    let lbl_pct = Label::builder()
+        .label("  0%")
+        .css_classes(vec!["val-pct".to_string()])
+        .width_chars(5)
+        .xalign(1.0)
+        .build();
+    row.append(&lbl_icon);
+    row.append(&lbl_name);
+    row.append(&lbl_ram);
+    row.append(&lbl_pct);
+    (row, lbl_ram, lbl_pct)
+}
+
+fn make_process_section() -> (GtkBox, Label, Label, Label, Label, Label) {
+    // returns: (container, proc, gfx, dec, enc, sm)
     let container = GtkBox::new(Orientation::Vertical, 4);
 
     let header_row = GtkBox::new(Orientation::Horizontal, 0);
     let lbl_name_hdr = Label::builder()
-        .label("Video")
-        .css_classes(vec!["lbl-util".to_string()])
+        .label("Process")
+        .css_classes(vec!["proc-hdr".to_string()])
         .hexpand(true)
         .xalign(0.0)
         .build();
+    let lbl_gfx_hdr = Label::builder()
+        .label("GFX")
+        .css_classes(vec!["proc-hdr".to_string()])
+        .width_chars(5)
+        .xalign(1.0)
+        .build();
     let lbl_dec_hdr = Label::builder()
         .label("DEC")
-        .css_classes(vec!["lbl-util".to_string()])
-        .width_chars(6)
+        .css_classes(vec!["proc-hdr".to_string()])
+        .width_chars(5)
         .xalign(1.0)
         .build();
     let lbl_enc_hdr = Label::builder()
         .label("ENC")
-        .css_classes(vec!["lbl-util".to_string()])
-        .width_chars(6)
+        .css_classes(vec!["proc-hdr".to_string()])
+        .width_chars(5)
         .xalign(1.0)
-        .build();
-    header_row.append(&lbl_name_hdr);
-    header_row.append(&lbl_dec_hdr);
-    header_row.append(&lbl_enc_hdr);
-
-    let data_row = GtkBox::new(Orientation::Horizontal, 0);
-    let lbl_proc = Label::builder()
-        .css_classes(vec!["val-proc".to_string()])
-        .hexpand(true)
-        .xalign(0.0)
-        .valign(gtk4::Align::Start)
-        .max_width_chars(16)
-        .ellipsize(gtk4::pango::EllipsizeMode::End)
-        .build();
-    let lbl_dec = Label::builder()
-        .css_classes(vec!["val-pct".to_string()])
-        .width_chars(6)
-        .xalign(1.0)
-        .valign(gtk4::Align::Start)
-        .build();
-    let lbl_enc = Label::builder()
-        .css_classes(vec!["val-pct".to_string()])
-        .width_chars(6)
-        .xalign(1.0)
-        .valign(gtk4::Align::Start)
-        .build();
-    data_row.append(&lbl_proc);
-    data_row.append(&lbl_dec);
-    data_row.append(&lbl_enc);
-
-    container.append(&header_row);
-    container.append(&data_row);
-
-    (container, lbl_proc, lbl_dec, lbl_enc)
-}
-
-fn make_compute_section() -> (GtkBox, Label, Label, Label) {
-    let container = GtkBox::new(Orientation::Vertical, 4);
-
-    let header_row = GtkBox::new(Orientation::Horizontal, 0);
-    let lbl_cuda_hdr = Label::builder()
-        .label("CUDA")
-        .css_classes(vec!["lbl-util".to_string()])
-        .hexpand(true)
-        .xalign(0.0)
         .build();
     let lbl_sm_hdr = Label::builder()
         .label("SM%")
-        .css_classes(vec!["lbl-util".to_string()])
-        .width_chars(6)
+        .css_classes(vec!["proc-hdr".to_string()])
+        .width_chars(5)
         .xalign(1.0)
         .build();
-    header_row.append(&lbl_cuda_hdr);
+    header_row.append(&lbl_name_hdr);
+    header_row.append(&lbl_gfx_hdr);
+    header_row.append(&lbl_dec_hdr);
+    header_row.append(&lbl_enc_hdr);
     header_row.append(&lbl_sm_hdr);
 
     let data_row = GtkBox::new(Orientation::Horizontal, 0);
     let lbl_proc = Label::builder()
-        .css_classes(vec!["val-proc".to_string()])
+        .css_classes(vec!["proc-val".to_string()])
         .hexpand(true)
         .xalign(0.0)
         .valign(gtk4::Align::Start)
-        .max_width_chars(16)
+        .max_width_chars(12)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .build();
+    let lbl_gfx = Label::builder()
+        .css_classes(vec!["proc-num".to_string()])
+        .width_chars(5)
+        .xalign(1.0)
+        .valign(gtk4::Align::Start)
+        .build();
+    let lbl_dec = Label::builder()
+        .css_classes(vec!["proc-num".to_string()])
+        .width_chars(5)
+        .xalign(1.0)
+        .valign(gtk4::Align::Start)
+        .build();
+    let lbl_enc = Label::builder()
+        .css_classes(vec!["proc-num".to_string()])
+        .width_chars(5)
+        .xalign(1.0)
+        .valign(gtk4::Align::Start)
+        .build();
     let lbl_sm = Label::builder()
-        .css_classes(vec!["val-pct".to_string()])
-        .width_chars(6)
+        .css_classes(vec!["proc-num".to_string()])
+        .width_chars(5)
         .xalign(1.0)
         .valign(gtk4::Align::Start)
         .build();
     data_row.append(&lbl_proc);
+    data_row.append(&lbl_gfx);
+    data_row.append(&lbl_dec);
+    data_row.append(&lbl_enc);
     data_row.append(&lbl_sm);
 
     container.append(&header_row);
     container.append(&data_row);
 
-    (container, lbl_proc, lbl_sm, lbl_sm_hdr)
+    (container, lbl_proc, lbl_gfx, lbl_dec, lbl_enc, lbl_sm)
 }
