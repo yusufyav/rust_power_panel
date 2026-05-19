@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{glib, Application, ApplicationWindow, Box as GtkBox, CssProvider, Label, Orientation};
+use gtk4::{glib, Application, ApplicationWindow, Box as GtkBox, CssProvider, Grid, Label, Orientation};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use nvml_wrapper::Nvml;
 use std::collections::HashMap;
@@ -335,6 +335,7 @@ struct SensorData {
     vram_used_mb: u32,
     vram_total_mb: u32,
     gpu_gfx_percent: u32,
+    cpu_percent: u32,
     ram_used_mb: u32,
     ram_total_mb: u32,
 }
@@ -441,7 +442,7 @@ fn cli_titled_sep(title: &str, w: usize) -> String {
     format!("\x1B[2m├{}{}┤\x1B[0m", prefix, "─".repeat(remaining))
 }
 
-fn render_cli_frame(cpu_watt: f32, cpu_temp: f32, gpu: &GpuData, ram_used_mb: u32, ram_total_mb: u32) {
+fn render_cli_frame(cpu_watt: f32, cpu_temp: f32, cpu_percent: u32, gpu: &GpuData, ram_used_mb: u32, ram_total_mb: u32) {
     use std::io::{self, Write};
 
     const W: usize = 38; // inner content width (between flanking spaces inside │)
@@ -474,16 +475,26 @@ fn render_cli_frame(cpu_watt: f32, cpu_temp: f32, gpu: &GpuData, ram_used_mb: u3
     println!("{mid}");
 
     // ── CPU ───────────────────────────────────────────────────────────────────
-    // "CPU  " 5 + "{:6.1}W" 7 + "   " 3 + "{:3.0}°C" 5 = 20, pad 18
     let cpu_tc = cli_temp_color(cpu_temp);
-    let cpu_p = format!("CPU  {:6.1}W   {:3.0}°C", cpu_watt, cpu_temp.floor());
-    let cpu_r = format!("{YL}CPU{R}  {WH}{:6.1}W{R}   {cpu_tc}{:3.0}°C{R}", cpu_watt, cpu_temp.floor());
+    let cpu_uc = if cpu_percent >= 90 { "\x1B[91m" } else if cpu_percent >= 75 { "\x1B[93m" } else { "\x1B[92m" };
+    let cpu_p = format!("CPU  {:6.1}W   {:3.0}°C   ●{:>3}%", cpu_watt, cpu_temp.floor(), cpu_percent);
+    let cpu_r = format!("{YL}CPU{R}  {WH}{:6.1}W{R}   {cpu_tc}{:3.0}°C{R}   {cpu_uc}●{:>3}%{R}", cpu_watt, cpu_temp.floor(), cpu_percent);
     println!("{}", cli_row(&cpu_p, &cpu_r, W));
 
     // ── GPU ───────────────────────────────────────────────────────────────────
     let gpu_tc = cli_temp_color(gpu.temp);
-    let gpu_p = format!("GPU  {:6.1}W   {:3.0}°C", gpu.watt, gpu.temp.floor());
-    let gpu_r = format!("{GN}GPU{R}  {WH}{:6.1}W{R}   {gpu_tc}{:3.0}°C{R}", gpu.watt, gpu.temp.floor());
+    let gpu_has_pct = !matches!(gpu.kind, GpuKind::Unknown | GpuKind::Intel);
+    let gpu_uc = if gpu.gfx_percent >= 90 { "\x1B[91m" } else if gpu.gfx_percent >= 75 { "\x1B[93m" } else { "\x1B[92m" };
+    let gpu_p = if gpu_has_pct {
+        format!("GPU  {:6.1}W   {:3.0}°C   ●{:>3}%", gpu.watt, gpu.temp.floor(), gpu.gfx_percent)
+    } else {
+        format!("GPU  {:6.1}W   {:3.0}°C   ●  —", gpu.watt, gpu.temp.floor())
+    };
+    let gpu_r = if gpu_has_pct {
+        format!("{GN}GPU{R}  {WH}{:6.1}W{R}   {gpu_tc}{:3.0}°C{R}   {gpu_uc}●{:>3}%{R}", gpu.watt, gpu.temp.floor(), gpu.gfx_percent)
+    } else {
+        format!("{GN}GPU{R}  {WH}{:6.1}W{R}   {gpu_tc}{:3.0}°C{R}   ●  —", gpu.watt, gpu.temp.floor())
+    };
     println!("{}", cli_row(&gpu_p, &gpu_r, W));
 
     // ── RAM ───────────────────────────────────────────────────────────────────
@@ -521,9 +532,8 @@ fn render_cli_frame(cpu_watt: f32, cpu_temp: f32, gpu: &GpuData, ram_used_mb: u3
             let s = if *sm > 0 { Some(*sm) } else { None };
             if let Some(entry) = combined.iter_mut().find(|(n, ..)| n == name) {
                 entry.4 = s;
-                if entry.1.is_none() { entry.1 = s; }
             } else {
-                combined.push((name.clone(), s, None, None, s));
+                combined.push((name.clone(), None, None, None, s));
             }
         }
 
@@ -632,10 +642,12 @@ fn run_cli_mode() {
             );
 
             sys.refresh_memory();
+            sys.refresh_cpu_usage();
             let ram_used_mb = (sys.used_memory() / 1_048_576) as u32;
             let ram_total_mb = (sys.total_memory() / 1_048_576) as u32;
+            let cpu_percent = sys.global_cpu_usage() as u32;
 
-            render_cli_frame(cpu_watt, cpu_temp, &gpu, ram_used_mb, ram_total_mb);
+            render_cli_frame(cpu_watt, cpu_temp, cpu_percent, &gpu, ram_used_mb, ram_total_mb);
 
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
@@ -674,27 +686,28 @@ fn read_gpu_data(
                 let mut codec_map: HashMap<u32, (u32, u32)> = HashMap::new();
                 let mut sm_by_pid: HashMap<u32, u32> = HashMap::new();
 
-                if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
-                    if !samples.is_empty() {
-                        let sm_sum: u32 = samples.iter().map(|s| s.sm_util).sum();
-                        data.gfx_percent = sm_sum.min(100);
+                // Primary GPU utilization: nvmlDeviceGetUtilizationRates — same API as nvidia-smi/nvidia-settings
+                if let Ok(util) = dev.utilization_rates() {
+                    data.gfx_percent = util.gpu;
+                }
 
-                        for s in &samples {
-                            if s.dec_util > 0 || s.enc_util > 0 {
-                                codec_map
-                                    .entry(s.pid)
-                                    .and_modify(|e| {
-                                        e.0 = e.0.max(s.dec_util);
-                                        e.1 = e.1.max(s.enc_util);
-                                    })
-                                    .or_insert((s.dec_util, s.enc_util));
-                            }
-                            if s.sm_util > 0 {
-                                sm_by_pid
-                                    .entry(s.pid)
-                                    .and_modify(|e| *e = (*e).max(s.sm_util))
-                                    .or_insert(s.sm_util);
-                            }
+                // Per-process stats: codec DEC/ENC and SM% per PID (separate from total utilization)
+                if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
+                    for s in &samples {
+                        if s.dec_util > 0 || s.enc_util > 0 {
+                            codec_map
+                                .entry(s.pid)
+                                .and_modify(|e| {
+                                    e.0 = e.0.max(s.dec_util);
+                                    e.1 = e.1.max(s.enc_util);
+                                })
+                                .or_insert((s.dec_util, s.enc_util));
+                        }
+                        if s.sm_util > 0 {
+                            sm_by_pid
+                                .entry(s.pid)
+                                .and_modify(|e| *e = (*e).max(s.sm_util))
+                                .or_insert(s.sm_util);
                         }
                     }
                 }
@@ -704,18 +717,17 @@ fn read_gpu_data(
                     sys.refresh_processes(ProcessesToUpdate::All, false);
                 }
 
-                // Codec → media_procs (DEC/ENC/GFX), independent of CUDA
+                // Codec → media_procs (DEC/ENC), independent of CUDA
                 for (pid, (dec, enc)) in codec_map {
                     let name = sys
                         .process(sysinfo::Pid::from(pid as usize))
                         .map(|p| p.name().to_string_lossy().into_owned())
                         .unwrap_or_else(|| format!("pid:{}", pid));
-                    let gfx = sm_by_pid.get(&pid).copied().unwrap_or(0);
-                    data.media_procs.push((name, dec, enc, gfx));
+                    data.media_procs.push((name, dec, enc, 0));
                 }
                 data.media_procs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
 
-                // CUDA → compute_procs: only show processes with active SM% (not idle loaders)
+                // CUDA → compute_procs: only show processes with active SM%
                 for pid in &cuda_pids {
                     let sm = sm_by_pid.get(pid).copied().unwrap_or(0);
                     if sm == 0 {
@@ -728,13 +740,6 @@ fn read_gpu_data(
                     data.compute_procs.push((name, sm));
                 }
                 data.compute_procs.sort_by(|a, b| b.1.cmp(&a.1));
-
-                // Fallback: utilization_rates() if process stats returned nothing
-                if data.gfx_percent == 0 {
-                    if let Ok(util) = dev.utilization_rates() {
-                        data.gfx_percent = util.gpu;
-                    }
-                }
             }
         }
         GpuBackend::Amd { hwmon_path, device_path, .. } => {
@@ -1090,10 +1095,10 @@ fn build_ui(app: &Application) {
     total_label.set_halign(gtk4::Align::Center);
     panel.append(&total_label);
 
-    let (cpu_row, cpu_watt_lbl, cpu_therm_lbl, cpu_temp_lbl) = make_hw_row("", "CPU", "lbl-cpu");
+    let (cpu_row, cpu_watt_lbl, cpu_therm_lbl, cpu_temp_lbl, cpu_pct_lbl) = make_hw_row("", "CPU", "lbl-cpu");
     panel.append(&cpu_row);
 
-    let (gpu_row, gpu_watt_lbl, gpu_therm_lbl, gpu_temp_lbl) = make_hw_row("󰢮", "GPU", "lbl-gpu");
+    let (gpu_row, gpu_watt_lbl, gpu_therm_lbl, gpu_temp_lbl, gpu_pct_lbl) = make_hw_row("󰢮", "GPU", "lbl-gpu");
     panel.append(&gpu_row);
 
     let (ram_row, ram_lbl, ram_pct_lbl) = make_ram_row();
@@ -1163,8 +1168,6 @@ fn build_ui(app: &Application) {
 
             let mut loop_count: u32 = 0;
             let mut gfx_max: u32 = 0;
-            let mut cpu_watt_ema: f32 = 0.0;
-            let mut gpu_watt_ema: f32 = 0.0;
 
             loop {
                 loop_count += 1;
@@ -1175,13 +1178,6 @@ fn build_ui(app: &Application) {
                         if let Ok(dev) = nvml.device_by_index(0) {
                             if let Ok(util) = dev.utilization_rates() {
                                 gfx_max = gfx_max.max(util.gpu);
-                            }
-                            if let Ok(samples) = dev.process_utilization_stats(Some(0)) {
-                                let sm: u32 = samples.iter()
-                                    .map(|s| s.sm_util)
-                                    .sum::<u32>()
-                                    .min(100);
-                                gfx_max = gfx_max.max(sm);
                             }
                         }
                     }
@@ -1261,33 +1257,25 @@ fn build_ui(app: &Application) {
                     gpu.gfx_percent = gpu.gfx_percent.max(gfx_max);
                     gfx_max = 0;
 
-                    // EMA smoothing: initialize directly on first non-zero reading to avoid cold-start lag
-                    cpu_watt_ema = if cpu_watt_ema == 0.0 && cpu_watt_raw > 0.0 {
-                        cpu_watt_raw
-                    } else {
-                        cpu_watt_ema * 0.8 + cpu_watt_raw * 0.2
-                    };
-                    gpu_watt_ema = if gpu_watt_ema == 0.0 && gpu.watt > 0.0 {
-                        gpu.watt
-                    } else {
-                        gpu_watt_ema * 0.8 + gpu.watt * 0.2
-                    };
 
                     sys.refresh_memory();
+                    sys.refresh_cpu_usage();
                     let ram_used_mb = (sys.used_memory() / 1_048_576) as u32;
                     let ram_total_mb = (sys.total_memory() / 1_048_576) as u32;
+                    let cpu_percent = sys.global_cpu_usage() as u32;
 
                     if let Ok(mut d) = data_writer.lock() {
                         d.cpu_temp = cpu_temp;
-                        d.cpu_watt = cpu_watt_ema;
+                        d.cpu_watt = cpu_watt_raw;
                         d.gpu_temp = gpu.temp;
-                        d.gpu_watt = gpu_watt_ema;
+                        d.gpu_watt = gpu.watt;
                         d.media_procs = gpu.media_procs;
                         d.compute_procs = gpu.compute_procs;
                         d.gpu_kind = gpu.kind;
                         d.vram_used_mb = gpu.vram_used_mb;
                         d.vram_total_mb = gpu.vram_total_mb;
                         d.gpu_gfx_percent = gpu.gfx_percent;
+                        d.cpu_percent = cpu_percent;
                         d.ram_used_mb = ram_used_mb;
                         d.ram_total_mb = ram_total_mb;
                     }
@@ -1310,13 +1298,19 @@ fn build_ui(app: &Application) {
         let cpu_cls = temp_css_class(target.cpu_temp);
         cpu_therm_lbl.set_css_classes(&[cpu_cls]);
         cpu_temp_lbl.set_css_classes(&[cpu_cls]);
-        cpu_temp_lbl.set_text(&format!("{:>3.0} °C", target.cpu_temp.floor()));
+        cpu_temp_lbl.set_text(&format!("{:>3.0}°C", target.cpu_temp.floor()));
+        cpu_pct_lbl.set_css_classes(&[usage_css_class(target.cpu_percent)]);
+        cpu_pct_lbl.set_text(&format!("●{:>3}%", target.cpu_percent));
 
         gpu_watt_lbl.set_text(&format!("{:>6.1} W", target.gpu_watt));
         let gpu_cls = temp_css_class(target.gpu_temp);
         gpu_therm_lbl.set_css_classes(&[gpu_cls]);
         gpu_temp_lbl.set_css_classes(&[gpu_cls]);
-        gpu_temp_lbl.set_text(&format!("{:>3.0} °C", target.gpu_temp.floor()));
+        gpu_temp_lbl.set_text(&format!("{:>3.0}°C", target.gpu_temp.floor()));
+        let gpu_has_pct = matches!(target.gpu_kind, GpuKind::Nvidia | GpuKind::Amd);
+        let gpu_pct_text = if gpu_has_pct { format!("●{:>3}%", target.gpu_gfx_percent) } else { "●  —".to_string() };
+        gpu_pct_lbl.set_css_classes(&[if gpu_has_pct { usage_css_class(target.gpu_gfx_percent) } else { "val-pct" }]);
+        gpu_pct_lbl.set_text(&gpu_pct_text);
 
         let valid_gpu = target.gpu_kind != GpuKind::Unknown;
 
@@ -1356,9 +1350,8 @@ fn build_ui(app: &Application) {
                 let sm_v = if *sm > 0 { Some(*sm) } else { None };
                 if let Some(entry) = combined.iter_mut().find(|(n, ..)| n == name) {
                     entry.4 = sm_v;
-                    if entry.1.is_none() { entry.1 = sm_v; }
                 } else {
-                    combined.push((name.clone(), sm_v, None, None, sm_v));
+                    combined.push((name.clone(), None, None, None, sm_v));
                 }
             }
 
@@ -1372,7 +1365,7 @@ fn build_ui(app: &Application) {
             let fmt_val = |v: Option<u32>| -> String {
                 match v {
                     Some(x) if x > 0 => format!("{:>3}%", x),
-                    _ => "  —".to_string(),
+                    _ => "   —".to_string(),
                 }
             };
 
@@ -1568,7 +1561,7 @@ fn read_u64(path: &str) -> Result<u64, std::io::Error> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label, Label) {
+fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label, Label, Label) {
     let row = GtkBox::new(Orientation::Horizontal, 0);
     let lbl_icon = Label::builder()
         .label(icon)
@@ -1595,9 +1588,15 @@ fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label, Labe
         .xalign(1.0)
         .build();
     let lbl_temp = Label::builder()
-        .label("  0 °C")
+        .label("  0°C")
         .css_classes(vec!["val-temp-cool".to_string()])
-        .width_chars(6)
+        .width_chars(5)
+        .xalign(1.0)
+        .build();
+    let lbl_pct = Label::builder()
+        .label("●  0%")
+        .css_classes(vec!["val-pct".to_string()])
+        .width_chars(5)
         .xalign(1.0)
         .build();
     row.append(&lbl_icon);
@@ -1605,7 +1604,8 @@ fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label, Labe
     row.append(&lbl_watt);
     row.append(&lbl_therm);
     row.append(&lbl_temp);
-    (row, lbl_watt, lbl_therm, lbl_temp)
+    row.append(&lbl_pct);
+    (row, lbl_watt, lbl_therm, lbl_temp, lbl_pct)
 }
 
 
@@ -1675,11 +1675,12 @@ fn make_ram_row() -> (GtkBox, Label, Label) {
     (row, lbl_ram, lbl_pct)
 }
 
-fn make_process_section() -> (GtkBox, Label, Label, Label, Label, Label) {
+fn make_process_section() -> (Grid, Label, Label, Label, Label, Label) {
     // returns: (container, proc, gfx, dec, enc, sm)
-    let container = GtkBox::new(Orientation::Vertical, 4);
+    // GtkGrid ensures header and data columns share the same allocated width,
+    // so xalign(1.0) right-aligns both header text and values to the same right edge.
+    let grid = Grid::builder().row_spacing(4).build();
 
-    let header_row = GtkBox::new(Orientation::Horizontal, 0);
     let lbl_name_hdr = Label::builder()
         .label("Process")
         .css_classes(vec!["proc-hdr".to_string()])
@@ -1689,34 +1690,24 @@ fn make_process_section() -> (GtkBox, Label, Label, Label, Label, Label) {
     let lbl_gfx_hdr = Label::builder()
         .label("GFX")
         .css_classes(vec!["proc-hdr".to_string()])
-        .width_chars(5)
         .xalign(1.0)
         .build();
     let lbl_dec_hdr = Label::builder()
         .label("DEC")
         .css_classes(vec!["proc-hdr".to_string()])
-        .width_chars(5)
         .xalign(1.0)
         .build();
     let lbl_enc_hdr = Label::builder()
         .label("ENC")
         .css_classes(vec!["proc-hdr".to_string()])
-        .width_chars(5)
         .xalign(1.0)
         .build();
     let lbl_sm_hdr = Label::builder()
         .label("SM%")
         .css_classes(vec!["proc-hdr".to_string()])
-        .width_chars(5)
         .xalign(1.0)
         .build();
-    header_row.append(&lbl_name_hdr);
-    header_row.append(&lbl_gfx_hdr);
-    header_row.append(&lbl_dec_hdr);
-    header_row.append(&lbl_enc_hdr);
-    header_row.append(&lbl_sm_hdr);
 
-    let data_row = GtkBox::new(Orientation::Horizontal, 0);
     let lbl_proc = Label::builder()
         .css_classes(vec!["proc-val".to_string()])
         .hexpand(true)
@@ -1727,36 +1718,40 @@ fn make_process_section() -> (GtkBox, Label, Label, Label, Label, Label) {
         .build();
     let lbl_gfx = Label::builder()
         .css_classes(vec!["proc-num".to_string()])
-        .width_chars(5)
         .xalign(1.0)
+        .justify(gtk4::Justification::Right)
         .valign(gtk4::Align::Start)
         .build();
     let lbl_dec = Label::builder()
         .css_classes(vec!["proc-num".to_string()])
-        .width_chars(5)
         .xalign(1.0)
+        .justify(gtk4::Justification::Right)
         .valign(gtk4::Align::Start)
         .build();
     let lbl_enc = Label::builder()
         .css_classes(vec!["proc-num".to_string()])
-        .width_chars(5)
         .xalign(1.0)
+        .justify(gtk4::Justification::Right)
         .valign(gtk4::Align::Start)
         .build();
     let lbl_sm = Label::builder()
         .css_classes(vec!["proc-num".to_string()])
-        .width_chars(5)
         .xalign(1.0)
+        .justify(gtk4::Justification::Right)
         .valign(gtk4::Align::Start)
         .build();
-    data_row.append(&lbl_proc);
-    data_row.append(&lbl_gfx);
-    data_row.append(&lbl_dec);
-    data_row.append(&lbl_enc);
-    data_row.append(&lbl_sm);
 
-    container.append(&header_row);
-    container.append(&data_row);
+    // Row 0: headers, Row 1: data
+    grid.attach(&lbl_name_hdr, 0, 0, 1, 1);
+    grid.attach(&lbl_gfx_hdr,  1, 0, 1, 1);
+    grid.attach(&lbl_dec_hdr,  2, 0, 1, 1);
+    grid.attach(&lbl_enc_hdr,  3, 0, 1, 1);
+    grid.attach(&lbl_sm_hdr,   4, 0, 1, 1);
+    grid.attach(&lbl_proc,     0, 1, 1, 1);
+    grid.attach(&lbl_gfx,      1, 1, 1, 1);
+    grid.attach(&lbl_dec,      2, 1, 1, 1);
+    grid.attach(&lbl_enc,      3, 1, 1, 1);
+    grid.attach(&lbl_sm,       4, 1, 1, 1);
 
-    (container, lbl_proc, lbl_gfx, lbl_dec, lbl_enc, lbl_sm)
+    (grid, lbl_proc, lbl_gfx, lbl_dec, lbl_enc, lbl_sm)
 }
