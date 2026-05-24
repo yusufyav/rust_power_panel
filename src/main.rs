@@ -599,27 +599,20 @@ fn render_bar(pct: u32, width: usize) -> (String, String) {
     const R:  &str = "\x1B[0m";
 
     let filled = (pct as usize * width / 100).min(width);
-    let seg = width / 4;
-    let colors = [GN, YL, OR, RD];
+    let color = if pct >= 75 { RD } else if pct >= 50 { OR } else if pct >= 25 { YL } else { GN };
 
     let plain: String = (0..width).map(|i| if i < filled { '█' } else { '░' }).collect();
-    let mut colored = String::new();
 
-    for s in 0..4usize {
-        let start = s * seg;
-        let end = if s == 3 { width } else { (s + 1) * seg };
-        let seg_filled = filled.saturating_sub(start).min(end - start);
-        let seg_empty  = (end - start) - seg_filled;
-        if seg_filled > 0 {
-            colored.push_str(colors[s]);
-            for _ in 0..seg_filled { colored.push('█'); }
-            colored.push_str(R);
-        }
-        if seg_empty > 0 {
-            colored.push_str(DM);
-            for _ in 0..seg_empty { colored.push('░'); }
-            colored.push_str(R);
-        }
+    let mut colored = String::new();
+    if filled > 0 {
+        colored.push_str(color);
+        for _ in 0..filled { colored.push('█'); }
+        colored.push_str(R);
+    }
+    if filled < width {
+        colored.push_str(DM);
+        for _ in filled..width { colored.push('░'); }
+        colored.push_str(R);
     }
 
     (plain, colored)
@@ -2065,32 +2058,28 @@ fn make_process_section() -> (Grid, Label, Label, Label, Label, Label) {
 // ── Bar-GUI helpers ───────────────────────────────────────────────────────────
 
 fn draw_bar_fn(cr: &gtk4::cairo::Context, width: i32, height: i32, pct: u32) {
-    let filled_w = (pct.min(100) as f64 / 100.0 * width as f64) as i32;
-    let seg = (width / 4).max(1);
-    const COLORS: [(f64, f64, f64); 4] = [
-        (0.18, 0.80, 0.44), // green
-        (0.95, 0.77, 0.06), // yellow
-        (0.90, 0.49, 0.13), // orange
-        (0.91, 0.30, 0.24), // red
-    ];
+    let pct = pct.min(100);
+    let filled_w = (pct as f64 / 100.0 * width as f64) as i32;
+    let (r, g, b) = if pct >= 75 {
+        (0.91, 0.30, 0.24) // red
+    } else if pct >= 50 {
+        (0.90, 0.49, 0.13) // orange
+    } else if pct >= 25 {
+        (0.95, 0.77, 0.06) // yellow
+    } else {
+        (0.18, 0.80, 0.44) // green
+    };
     let y = 1.0_f64;
     let h = (height - 2) as f64;
-    for s in 0..4i32 {
-        let x0 = s * seg;
-        let x1 = if s == 3 { width } else { (s + 1) * seg };
-        let sw = x1 - x0;
-        let sf = (filled_w - x0).clamp(0, sw);
-        let (r, g, b) = COLORS[s as usize];
-        if sf > 0 {
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(x0 as f64, y, sf as f64, h);
-            cr.fill().ok();
-        }
-        if sf < sw {
-            cr.set_source_rgba(r, g, b, 0.15);
-            cr.rectangle((x0 + sf) as f64, y, (sw - sf) as f64, h);
-            cr.fill().ok();
-        }
+    if filled_w > 0 {
+        cr.set_source_rgb(r, g, b);
+        cr.rectangle(0.0, y, filled_w as f64, h);
+        cr.fill().ok();
+    }
+    if filled_w < width {
+        cr.set_source_rgba(r, g, b, 0.15);
+        cr.rectangle(filled_w as f64, y, (width - filled_w) as f64, h);
+        cr.fill().ok();
     }
 }
 
