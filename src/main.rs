@@ -2,8 +2,10 @@ use gtk4::prelude::*;
 use gtk4::{glib, Application, ApplicationWindow, Box as GtkBox, CssProvider, Grid, Label, Orientation};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use nvml_wrapper::Nvml;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Components, ProcessesToUpdate, System};
@@ -376,6 +378,16 @@ fn main() -> glib::ExitCode {
                 run_cli_mode();
                 return glib::ExitCode::SUCCESS;
             }
+            "--tui" => {
+                run_tui_mode();
+                return glib::ExitCode::SUCCESS;
+            }
+            "--gui2" => {
+                let app = Application::builder().application_id(APP_ID).build();
+                app.connect_activate(build_ui2);
+                let argv0 = args.first().map(String::as_str).unwrap_or("power_panel");
+                return app.run_with_args(&[argv0]);
+            }
             "--debug" => {
                 let rapl_path = find_rapl_path();
                 let gpu = detect_gpu();
@@ -411,6 +423,8 @@ fn print_help() {
     println!("  --help, -h       Bu yardım mesajını gösterir");
     println!("  --version, -v    Versiyon bilgisini gösterir");
     println!("  --cli            CLI (Terminal) modunda çalıştır");
+    println!("  --tui            TUI (Bar görünümlü) modunda çalıştır");
+    println!("  --gui2           Alternatif bar-görünümlü GUI modunda çalıştır");
     println!("  --debug          Sensör teşhisini çalıştır ve çık");
     println!();
     println!("ÖRNEKLER:");
@@ -576,6 +590,216 @@ fn render_cli_frame(cpu_watt: f32, cpu_temp: f32, cpu_percent: u32, gpu: &GpuDat
     io::stdout().flush().unwrap();
 }
 
+fn render_bar(pct: u32, width: usize) -> (String, String) {
+    const GN: &str = "\x1B[92m";
+    const YL: &str = "\x1B[93m";
+    const OR: &str = "\x1B[38;5;208m";
+    const RD: &str = "\x1B[91m";
+    const DM: &str = "\x1B[2m";
+    const R:  &str = "\x1B[0m";
+
+    let filled = (pct as usize * width / 100).min(width);
+    let seg = width / 4;
+    let colors = [GN, YL, OR, RD];
+
+    let plain: String = (0..width).map(|i| if i < filled { '█' } else { '░' }).collect();
+    let mut colored = String::new();
+
+    for s in 0..4usize {
+        let start = s * seg;
+        let end = if s == 3 { width } else { (s + 1) * seg };
+        let seg_filled = filled.saturating_sub(start).min(end - start);
+        let seg_empty  = (end - start) - seg_filled;
+        if seg_filled > 0 {
+            colored.push_str(colors[s]);
+            for _ in 0..seg_filled { colored.push('█'); }
+            colored.push_str(R);
+        }
+        if seg_empty > 0 {
+            colored.push_str(DM);
+            for _ in 0..seg_empty { colored.push('░'); }
+            colored.push_str(R);
+        }
+    }
+
+    (plain, colored)
+}
+
+fn fmt_gb(used_mb: u32, total_mb: u32) -> String {
+    let used  = used_mb  as f32 / 1024.0;
+    let total = total_mb as f32 / 1024.0;
+    if total >= 100.0 {
+        format!("{:.0}/{:.0} GB", used, total)   // "128/256 GB" = 10
+    } else {
+        format!("{:.1}/{:.0} GB", used, total)   // "14.5/32 GB" = 10 | "7.8/16 GB" = 9
+    }
+}
+
+fn render_tui_frame(cpu_watt: f32, cpu_temp: f32, cpu_percent: u32, gpu: &GpuData, ram_used_mb: u32, ram_total_mb: u32) {
+    use std::io::{self, Write};
+
+    const W:   usize = 44;
+    const BAR: usize = 28;
+
+    const R:  &str = "\x1B[0m";
+    const BD: &str = "\x1B[1m";
+    const DM: &str = "\x1B[2m";
+    const CY: &str = "\x1B[96m";
+    const YL: &str = "\x1B[93m";
+    const GN: &str = "\x1B[92m";
+    const WH: &str = "\x1B[97m";
+    const BL: &str = "\x1B[94m";
+    const PR: &str = "\x1B[95m";
+
+    let top = format!("{DM}┌{}┐{R}", "─".repeat(W + 2));
+    let mid = format!("{DM}├{}┤{R}", "─".repeat(W + 2));
+    let bot = format!("{DM}└{}┘{R}", "─".repeat(W + 2));
+
+    let total = cpu_watt + gpu.watt;
+
+    // pct → right-justified 10-char value string (plain + colored)
+    let pct_val = |pct: u32, color: &str| -> (String, String) {
+        let s = format!("{:>3}%", pct);           // always 4 visible chars
+        let pad = " ".repeat(10usize.saturating_sub(s.chars().count()));
+        let plain   = format!("{}{}", pad, s);
+        let colored = format!("{}{}{}{}", pad, color, s, R);
+        (plain, colored)
+    };
+
+    // "  —" right-justified in 10 chars
+    let dash_val = || -> (String, String) {
+        let s = "  —";
+        let pad = " ".repeat(10usize.saturating_sub(s.chars().count()));
+        let plain   = format!("{}{}", pad, s);
+        let colored = format!("{}{DM}{}{R}", pad, s);
+        (plain, colored)
+    };
+
+    print!("\x1B[2J\x1B[H");
+
+    // ── Title ──────────────────────────────────────────────────────────────
+    // "PowerPanel" (10) + {:>33.1} (33) + "W" (1) = 44
+    let title_p = format!("PowerPanel{:>33.1}W", total);
+    let title_r = format!("{BD}{CY}PowerPanel{R}{:>33.1}{BD}{WH}W{R}", total);
+    println!("{top}");
+    println!("{}", cli_row(&title_p, &title_r, W));
+    println!("{mid}");
+
+    // ── CPU bar ────────────────────────────────────────────────────────────
+    // "CPU  " (5) + bar (28) + " " (1) + val (10) = 44
+    let (cpu_bar_p, cpu_bar_r) = render_bar(cpu_percent.min(100), BAR);
+    let (cpu_val_p, cpu_val_r) = pct_val(cpu_percent, CY);
+    let cpu_p = format!("CPU  {} {}", cpu_bar_p, cpu_val_p);
+    let cpu_r = format!("{YL}CPU{R}  {} {}", cpu_bar_r, cpu_val_r);
+    println!("{}", cli_row(&cpu_p, &cpu_r, W));
+
+    // ── GPU bar ────────────────────────────────────────────────────────────
+    let gpu_has_pct = !matches!(gpu.kind, GpuKind::Unknown | GpuKind::Intel);
+    let gpu_pct = if gpu_has_pct { gpu.gfx_percent } else { 0 };
+    let (gpu_bar_p, gpu_bar_r) = render_bar(gpu_pct.min(100), BAR);
+    let (gpu_val_p, gpu_val_r) = if gpu_has_pct { pct_val(gpu_pct, GN) } else { dash_val() };
+    let gpu_p = format!("GPU  {} {}", gpu_bar_p, gpu_val_p);
+    let gpu_r = format!("{GN}GPU{R}  {} {}", gpu_bar_r, gpu_val_r);
+    println!("{}", cli_row(&gpu_p, &gpu_r, W));
+
+    // ── RAM bar ────────────────────────────────────────────────────────────
+    if ram_total_mb > 0 {
+        let ram_pct = (ram_used_mb * 100 / ram_total_mb).min(100);
+        let (ram_bar_p, ram_bar_r) = render_bar(ram_pct, BAR);
+        let ram_val = fmt_gb(ram_used_mb, ram_total_mb);
+        let ram_p = format!("RAM  {} {}", ram_bar_p, ram_val);
+        let ram_r = format!("{YL}RAM{R}  {} {BL}{}{R}", ram_bar_r, ram_val);
+        println!("{}", cli_row(&ram_p, &ram_r, W));
+    }
+
+    // ── VRAM bar ───────────────────────────────────────────────────────────
+    if gpu.vram_total_mb > 0 {
+        let vram_pct = (gpu.vram_used_mb * 100 / gpu.vram_total_mb).min(100);
+        let (vram_bar_p, vram_bar_r) = render_bar(vram_pct, BAR);
+        let vram_val = fmt_gb(gpu.vram_used_mb, gpu.vram_total_mb);
+        let vram_p = format!("VRAM {} {}", vram_bar_p, vram_val);
+        let vram_r = format!("{GN}VRAM{R} {} {BL}{}{R}", vram_bar_r, vram_val);
+        println!("{}", cli_row(&vram_p, &vram_r, W));
+    }
+
+    // ── Temp & Power strip ─────────────────────────────────────────────────
+    // "CPU  " (5) + temp (5) + "  " (2) + watt (6) + "        " (8) + "GPU  " (5) + temp (5) + "  " (2) + watt (6) = 44
+    println!("{mid}");
+    let cpu_tc = cli_temp_color(cpu_temp);
+    let gpu_tc = cli_temp_color(gpu.temp);
+    let stats_p = format!(
+        "CPU  {:>3.0}°C  {:>5.1}W        GPU  {:>3.0}°C  {:>5.1}W",
+        cpu_temp.floor(), cpu_watt, gpu.temp.floor(), gpu.watt
+    );
+    let stats_r = format!(
+        "{YL}CPU{R}  {cpu_tc}{:>3.0}°C{R}  {WH}{:>5.1}W{R}        {GN}GPU{R}  {gpu_tc}{:>3.0}°C{R}  {WH}{:>5.1}W{R}",
+        cpu_temp.floor(), cpu_watt, gpu.temp.floor(), gpu.watt
+    );
+    println!("{}", cli_row(&stats_p, &stats_r, W));
+
+    // ── Process table ──────────────────────────────────────────────────────
+    let has_compute = !gpu.compute_procs.is_empty();
+    if !gpu.media_procs.is_empty() || has_compute {
+        println!("{}", cli_titled_sep("Procs", W));
+
+        let mut combined: Vec<(String, Option<u32>, Option<u32>, Option<u32>, Option<u32>)> = Vec::new();
+        for (name, dec, enc, gfx) in &gpu.media_procs {
+            let g = if *gfx > 0 { Some(*gfx) } else { None };
+            let d = if *dec > 0 { Some(*dec) } else { None };
+            let e = if *enc > 0 { Some(*enc) } else { None };
+            combined.push((name.clone(), g, d, e, None));
+        }
+        for (name, sm) in &gpu.compute_procs {
+            let s = if *sm > 0 { Some(*sm) } else { None };
+            if let Some(entry) = combined.iter_mut().find(|(n, ..)| n == name) {
+                entry.4 = s;
+            } else {
+                combined.push((name.clone(), None, None, None, s));
+            }
+        }
+
+        let fmt_v = |v: Option<u32>| -> String {
+            match v {
+                Some(x) if x > 0 => format!("{:>3}%", x),
+                _ => "  —".to_string(),
+            }
+        };
+
+        // W=44: with SM    → {:<12} {:>7} {:>7} {:>7} {:>7} = 12+1+7+1+7+1+7+1+7 = 44
+        //        without SM → {:<14} {:>9} {:>9} {:>9}       = 14+1+9+1+9+1+9     = 44
+        if has_compute {
+            let hdr_p = format!("{:<12} {:>7} {:>7} {:>7} {:>7}", "Process", "GFX", "DEC", "ENC", "SM%");
+            let hdr_r = format!("{DM}{:<12} {:>7} {:>7} {:>7} {:>7}{R}", "Process", "GFX", "DEC", "ENC", "SM%");
+            println!("{}", cli_row(&hdr_p, &hdr_r, W));
+        } else {
+            let hdr_p = format!("{:<14} {:>9} {:>9} {:>9}", "Process", "GFX", "DEC", "ENC");
+            let hdr_r = format!("{DM}{:<14} {:>9} {:>9} {:>9}{R}", "Process", "GFX", "DEC", "ENC");
+            println!("{}", cli_row(&hdr_p, &hdr_r, W));
+        }
+
+        for (name, gfx, dec, enc, sm) in combined.iter().take(4) {
+            if has_compute {
+                let name_t: String = if name.chars().count() > 11 {
+                    format!("{}…", name.chars().take(10).collect::<String>())
+                } else { name.clone() };
+                let row_p = format!("  {:<10} {:>7} {:>7} {:>7} {:>7}", name_t, fmt_v(*gfx), fmt_v(*dec), fmt_v(*enc), fmt_v(*sm));
+                let row_r = format!("  {PR}{:<10}{R} {WH}{:>7} {:>7} {:>7} {:>7}{R}", name_t, fmt_v(*gfx), fmt_v(*dec), fmt_v(*enc), fmt_v(*sm));
+                println!("{}", cli_row(&row_p, &row_r, W));
+            } else {
+                let name_t: String = if name.chars().count() > 13 {
+                    format!("{}…", name.chars().take(12).collect::<String>())
+                } else { name.clone() };
+                let row_p = format!("  {:<12} {:>9} {:>9} {:>9}", name_t, fmt_v(*gfx), fmt_v(*dec), fmt_v(*enc));
+                let row_r = format!("  {PR}{:<12}{R} {WH}{:>9} {:>9} {:>9}{R}", name_t, fmt_v(*gfx), fmt_v(*dec), fmt_v(*enc));
+                println!("{}", cli_row(&row_p, &row_r, W));
+            }
+        }
+    }
+
+    println!("{bot}");
+    io::stdout().flush().unwrap();
+}
+
 fn run_cli_mode() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -648,6 +872,84 @@ fn run_cli_mode() {
             let cpu_percent = sys.global_cpu_usage() as u32;
 
             render_cli_frame(cpu_watt, cpu_temp, cpu_percent, &gpu, ram_used_mb, ram_total_mb);
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+    });
+}
+
+fn run_tui_mode() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let gpu_backend = detect_gpu();
+        let mut sys = System::new();
+
+        let mut intel_gpu_tracker: Option<GpuPowerTracker> = None;
+        let mut amd_fdinfo_tracker = match &gpu_backend {
+            GpuBackend::Amd { pdev, vcn_instances, .. } => {
+                Some(FdInfoTracker::new(pdev.clone(), *vcn_instances))
+            }
+            _ => None,
+        };
+        let mut intel_fdinfo_tracker = match &gpu_backend {
+            GpuBackend::Intel { .. } => Some(IntelFdInfoTracker::new()),
+            _ => None,
+        };
+
+        let mut cpu_tracker = PowerTracker {
+            path: find_rapl_path(),
+            last_energy: 0,
+            last_time: Instant::now(),
+        };
+        if let Some(p) = cpu_tracker.path {
+            cpu_tracker.last_energy = read_u64(p).unwrap_or(0);
+        }
+
+        let cpu_temp_path = detect_cpu_temp_path();
+
+        loop {
+            let cpu_temp = if let Some(ref path) = cpu_temp_path {
+                read_u64(path).map(|v| v as f32 / 1000.0).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+
+            let cpu_watt = if let Some(path) = cpu_tracker.path {
+                match read_u64(path) {
+                    Ok(current) => {
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(cpu_tracker.last_time).as_secs_f32();
+                        let watts = if elapsed > 0.1 {
+                            let diff = current.saturating_sub(cpu_tracker.last_energy);
+                            (diff as f32 / elapsed) / 1_000_000.0
+                        } else {
+                            0.0
+                        };
+                        cpu_tracker.last_energy = current;
+                        cpu_tracker.last_time = now;
+                        if watts > 1.0 && watts < 400.0 { watts } else { 0.0 }
+                    }
+                    Err(_) => 0.0,
+                }
+            } else {
+                0.0
+            };
+
+            let gpu = read_gpu_data(
+                &gpu_backend,
+                &mut sys,
+                &mut intel_gpu_tracker,
+                &mut amd_fdinfo_tracker,
+                &mut intel_fdinfo_tracker,
+            );
+
+            sys.refresh_memory();
+            sys.refresh_cpu_usage();
+            let ram_used_mb = (sys.used_memory() / 1_048_576) as u32;
+            let ram_total_mb = (sys.total_memory() / 1_048_576) as u32;
+            let cpu_percent = sys.global_cpu_usage() as u32;
+
+            render_tui_frame(cpu_watt, cpu_temp, cpu_percent, &gpu, ram_used_mb, ram_total_mb);
 
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
@@ -980,6 +1282,10 @@ fn usage_css_class(pct: u32) -> &'static str {
     if pct >= 90 { "val-temp-hot" }
     else if pct >= 75 { "val-temp-warm" }
     else { "val-pct" }
+}
+
+fn temp_hex_color(t: f32) -> &'static str {
+    if t >= 80.0 { "#ff4757" } else if t >= 60.0 { "#ff9f43" } else { "#4cd964" }
 }
 
 // ── UI ────────────────────────────────────────────────────────────────────────
@@ -1754,4 +2060,480 @@ fn make_process_section() -> (Grid, Label, Label, Label, Label, Label) {
     grid.attach(&lbl_sm,       4, 1, 1, 1);
 
     (grid, lbl_proc, lbl_gfx, lbl_dec, lbl_enc, lbl_sm)
+}
+
+// ── Bar-GUI helpers ───────────────────────────────────────────────────────────
+
+fn draw_bar_fn(cr: &gtk4::cairo::Context, width: i32, height: i32, pct: u32) {
+    let filled_w = (pct.min(100) as f64 / 100.0 * width as f64) as i32;
+    let seg = (width / 4).max(1);
+    const COLORS: [(f64, f64, f64); 4] = [
+        (0.18, 0.80, 0.44), // green
+        (0.95, 0.77, 0.06), // yellow
+        (0.90, 0.49, 0.13), // orange
+        (0.91, 0.30, 0.24), // red
+    ];
+    let y = 1.0_f64;
+    let h = (height - 2) as f64;
+    for s in 0..4i32 {
+        let x0 = s * seg;
+        let x1 = if s == 3 { width } else { (s + 1) * seg };
+        let sw = x1 - x0;
+        let sf = (filled_w - x0).clamp(0, sw);
+        let (r, g, b) = COLORS[s as usize];
+        if sf > 0 {
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(x0 as f64, y, sf as f64, h);
+            cr.fill().ok();
+        }
+        if sf < sw {
+            cr.set_source_rgba(r, g, b, 0.15);
+            cr.rectangle((x0 + sf) as f64, y, (sw - sf) as f64, h);
+            cr.fill().ok();
+        }
+    }
+}
+
+fn make_bar_row_2(
+    label: &str,
+    css_class: &str,
+    val_width_chars: i32,
+) -> (GtkBox, gtk4::DrawingArea, Rc<Cell<u32>>, Label) {
+    let row = GtkBox::new(Orientation::Horizontal, 6);
+    row.set_valign(gtk4::Align::Center);
+
+    let lbl = Label::builder()
+        .label(label)
+        .css_classes(vec![css_class.to_string()])
+        .width_chars(4)
+        .xalign(0.0)
+        .build();
+
+    let pct_cell = Rc::new(Cell::new(0u32));
+    let pct_draw = pct_cell.clone();
+
+    let bar = gtk4::DrawingArea::new();
+    bar.set_hexpand(true);
+    bar.set_content_height(12);
+    bar.set_valign(gtk4::Align::Center);
+    bar.set_draw_func(move |_, cr, w, h| draw_bar_fn(cr, w, h, pct_draw.get()));
+
+    let val_lbl = Label::builder()
+        .label("")
+        .css_classes(vec!["val-pct".to_string()])
+        .width_chars(val_width_chars)
+        .xalign(1.0)
+        .build();
+
+    row.append(&lbl);
+    row.append(&bar);
+    row.append(&val_lbl);
+
+    (row, bar, pct_cell, val_lbl)
+}
+
+fn build_ui2(app: &Application) {
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .default_width(340)
+        .default_height(1)
+        .decorated(false)
+        .build();
+
+    window.init_layer_shell();
+    window.set_layer(Layer::Overlay);
+    window.set_anchor(Edge::Top, true);
+    window.set_anchor(Edge::Right, true);
+    window.set_margin(Edge::Top, 60);
+    window.set_margin(Edge::Right, 20);
+    window.set_keyboard_mode(KeyboardMode::None);
+
+    let css = CssProvider::new();
+    css.load_from_data(
+        "
+        window { background-color: transparent; }
+        .panel2 {
+            background-color: rgba(10, 10, 10, 0.82);
+            border-radius: 18px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            padding: 14px 18px;
+        }
+        .brand-lbl {
+            color: #a0a8b0;
+            font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 13px;
+        }
+        .total-watt {
+            color: #00ffcc;
+            font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 22px; font-weight: bold;
+        }
+        .lbl-cpu {
+            color: #ff9f43;
+            font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 14px; font-weight: bold;
+        }
+        .lbl-gpu {
+            color: #2ecc71;
+            font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 14px; font-weight: bold;
+        }
+        .lbl-ram {
+            color: #00cec9;
+            font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 14px; font-weight: bold;
+        }
+        .val-pct {
+            color: #dfe6e9;
+            font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 13px;
+        }
+        .stat-lbl {
+            font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 13px;
+        }
+        .divider {
+            background-color: rgba(255, 255, 255, 0.10);
+            min-height: 1px; margin: 2px 0px;
+        }
+        .proc-hdr {
+            color: #a29bfe;
+            font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 12px; font-weight: bold;
+        }
+        .proc-val {
+            color: #b2bec3;
+            font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }
+        .proc-num {
+            color: #dfe6e9;
+            font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }
+        ",
+    );
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::gdk::Display::default().unwrap(),
+        &css,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    // ── Layout ─────────────────────────────────────────────────────────────
+    let panel = GtkBox::new(Orientation::Vertical, 6);
+    panel.add_css_class("panel2");
+    panel.set_size_request(340, -1);
+
+    // Title row: brand left, total watts right
+    let title_row = GtkBox::new(Orientation::Horizontal, 0);
+    let brand_lbl = Label::builder()
+        .label("PowerPanel")
+        .css_classes(vec!["brand-lbl".to_string()])
+        .hexpand(true)
+        .xalign(0.0)
+        .valign(gtk4::Align::End)
+        .build();
+    let total_label = Label::builder()
+        .label("⚡  0.0 W")
+        .css_classes(vec!["total-watt".to_string()])
+        .xalign(1.0)
+        .build();
+    title_row.append(&brand_lbl);
+    title_row.append(&total_label);
+    panel.append(&title_row);
+
+    let sep_top = gtk4::Separator::new(Orientation::Horizontal);
+    sep_top.add_css_class("divider");
+    panel.append(&sep_top);
+
+    // Bar rows: CPU, GPU (pct val), RAM, VRAM (GB val)
+    let (cpu_row, cpu_bar, cpu_pct_cell, cpu_val_lbl) = make_bar_row_2("CPU", "lbl-cpu", 5);
+    panel.append(&cpu_row);
+
+    let (gpu_row, gpu_bar, gpu_pct_cell, gpu_val_lbl) = make_bar_row_2("GPU", "lbl-gpu", 5);
+    panel.append(&gpu_row);
+
+    let (ram_row, ram_bar, ram_pct_cell, ram_val_lbl) = make_bar_row_2("RAM", "lbl-ram", 11);
+    panel.append(&ram_row);
+
+    let (vram_row, vram_bar, vram_pct_cell, vram_val_lbl) = make_bar_row_2("VRAM", "lbl-gpu", 11);
+    vram_row.set_visible(false);
+    panel.append(&vram_row);
+
+    // Stats strip: CPU temp/watt | GPU temp/watt
+    let sep_mid = gtk4::Separator::new(Orientation::Horizontal);
+    sep_mid.add_css_class("divider");
+    panel.append(&sep_mid);
+
+    let stats_row = GtkBox::new(Orientation::Horizontal, 0);
+    let cpu_stat_lbl = Label::builder()
+        .use_markup(true)
+        .label("<span foreground='#ff9f43'><b>CPU</b></span>  --°C    0.0W")
+        .css_classes(vec!["stat-lbl".to_string()])
+        .hexpand(true)
+        .xalign(0.0)
+        .build();
+    let gpu_stat_lbl = Label::builder()
+        .use_markup(true)
+        .label("<span foreground='#2ecc71'><b>GPU</b></span>  --°C    0.0W")
+        .css_classes(vec!["stat-lbl".to_string()])
+        .xalign(1.0)
+        .build();
+    stats_row.append(&cpu_stat_lbl);
+    stats_row.append(&gpu_stat_lbl);
+    panel.append(&stats_row);
+
+    // Process section
+    let sep2 = gtk4::Separator::new(Orientation::Horizontal);
+    sep2.add_css_class("divider");
+    sep2.set_visible(false);
+    panel.append(&sep2);
+
+    let (proc_container, proc_lbl, gfx_lbl, dec_lbl, enc_lbl, sm_lbl) = make_process_section();
+    proc_container.set_visible(false);
+    panel.append(&proc_container);
+
+    window.set_child(Some(&panel));
+
+    let gesture = gtk4::GestureClick::new();
+    gesture.set_button(3);
+    let win_clone = window.clone();
+    gesture.connect_released(move |_, _, _, _| win_clone.close());
+    window.add_controller(gesture);
+
+    window.present();
+
+    // ── Background sensor thread (same as build_ui) ─────────────────────
+    let data = Arc::new(Mutex::new(SensorData::default()));
+    let data_writer = data.clone();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let mut comps = Components::new_with_refreshed_list();
+            let mut sys = System::new();
+            let gpu_backend = detect_gpu();
+
+            let mut intel_gpu_tracker: Option<GpuPowerTracker> = None;
+            let mut amd_fdinfo_tracker = match &gpu_backend {
+                GpuBackend::Amd { pdev, vcn_instances, .. } => Some(FdInfoTracker::new(pdev.clone(), *vcn_instances)),
+                _ => None,
+            };
+            let mut intel_fdinfo_tracker = match &gpu_backend {
+                GpuBackend::Intel { .. } => Some(IntelFdInfoTracker::new()),
+                _ => None,
+            };
+
+            let mut tracker = PowerTracker {
+                path: find_rapl_path(),
+                last_energy: 0,
+                last_time: Instant::now(),
+            };
+            if let Some(p) = tracker.path {
+                tracker.last_energy = read_u64(p).unwrap_or(0);
+            }
+
+            let cpu_temp_path = detect_cpu_temp_path();
+            let mut loop_count: u32 = 0;
+            let mut gfx_max: u32 = 0;
+
+            loop {
+                loop_count += 1;
+
+                match &gpu_backend {
+                    GpuBackend::Nvidia(nvml) => {
+                        if let Ok(dev) = nvml.device_by_index(0) {
+                            if let Ok(util) = dev.utilization_rates() {
+                                gfx_max = gfx_max.max(util.gpu);
+                            }
+                        }
+                    }
+                    GpuBackend::Amd { device_path, .. } => {
+                        if let Ok(v) = read_u64(&format!("{}/gpu_busy_percent", device_path)) {
+                            gfx_max = gfx_max.max(v as u32);
+                        }
+                    }
+                    _ => {}
+                }
+
+                if loop_count % 5 == 1 {
+                    let cpu_temp = if let Some(ref path) = cpu_temp_path {
+                        read_u64(path).map(|v| v as f32 / 1000.0).unwrap_or(0.0)
+                    } else {
+                        comps.refresh(false);
+                        let mut temp = 0.0f32;
+                        let mut found_die = false;
+                        for c in &comps {
+                            let lbl = c.label().to_lowercase();
+                            if lbl == "tdie" {
+                                if let Some(t) = c.temperature() { temp = t; found_die = true; break; }
+                            }
+                        }
+                        if !found_die {
+                            for c in &comps {
+                                let lbl = c.label().to_lowercase();
+                                if lbl == "tctl" || lbl.contains("k10") || lbl.contains("composite") || lbl.contains("package") {
+                                    if let Some(t) = c.temperature() { if t > temp { temp = t; } }
+                                }
+                            }
+                        }
+                        temp
+                    };
+
+                    let cpu_watt_raw = if let Some(path) = tracker.path {
+                        match read_u64(path) {
+                            Ok(current) => {
+                                let now = Instant::now();
+                                let elapsed = now.duration_since(tracker.last_time).as_secs_f32();
+                                let watts = if elapsed > 0.1 {
+                                    let diff = current.saturating_sub(tracker.last_energy);
+                                    (diff as f32 / elapsed) / 1_000_000.0
+                                } else { 0.0 };
+                                tracker.last_energy = current;
+                                tracker.last_time = now;
+                                if watts > 1.0 && watts < 400.0 { watts } else { 0.0 }
+                            }
+                            Err(_) => 0.0,
+                        }
+                    } else { 0.0 };
+
+                    let mut gpu = read_gpu_data(
+                        &gpu_backend, &mut sys,
+                        &mut intel_gpu_tracker,
+                        &mut amd_fdinfo_tracker,
+                        &mut intel_fdinfo_tracker,
+                    );
+                    gpu.gfx_percent = gpu.gfx_percent.max(gfx_max);
+                    gfx_max = 0;
+
+                    sys.refresh_memory();
+                    sys.refresh_cpu_usage();
+                    let ram_used_mb  = (sys.used_memory()  / 1_048_576) as u32;
+                    let ram_total_mb = (sys.total_memory() / 1_048_576) as u32;
+                    let cpu_percent  = sys.global_cpu_usage() as u32;
+
+                    if let Ok(mut d) = data_writer.lock() {
+                        d.cpu_temp       = cpu_temp;
+                        d.cpu_watt       = cpu_watt_raw;
+                        d.gpu_temp       = gpu.temp;
+                        d.gpu_watt       = gpu.watt;
+                        d.media_procs    = gpu.media_procs;
+                        d.compute_procs  = gpu.compute_procs;
+                        d.gpu_kind       = gpu.kind;
+                        d.vram_used_mb   = gpu.vram_used_mb;
+                        d.vram_total_mb  = gpu.vram_total_mb;
+                        d.gpu_gfx_percent = gpu.gfx_percent;
+                        d.cpu_percent    = cpu_percent;
+                        d.ram_used_mb    = ram_used_mb;
+                        d.ram_total_mb   = ram_total_mb;
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+    });
+
+    // ── GTK update loop ─────────────────────────────────────────────────────
+    glib::timeout_add_local(Duration::from_millis(1000), move || {
+        let target = match data.lock() {
+            Ok(d) => d.clone(),
+            Err(_) => return glib::ControlFlow::Continue,
+        };
+
+        total_label.set_text(&format!("⚡ {:>6.1} W", target.cpu_watt + target.gpu_watt));
+
+        // CPU bar
+        cpu_pct_cell.set(target.cpu_percent.min(100));
+        cpu_bar.queue_draw();
+        cpu_val_lbl.set_text(&format!("{:>3}%", target.cpu_percent));
+
+        // GPU bar
+        let gpu_has_pct = matches!(target.gpu_kind, GpuKind::Nvidia | GpuKind::Amd);
+        let gpu_pct = if gpu_has_pct { target.gpu_gfx_percent.min(100) } else { 0 };
+        gpu_pct_cell.set(gpu_pct);
+        gpu_bar.queue_draw();
+        let gpu_val_str = if gpu_has_pct { format!("{:>3}%", target.gpu_gfx_percent) } else { "  —".to_string() };
+        gpu_val_lbl.set_text(&gpu_val_str);
+
+        // RAM bar
+        if target.ram_total_mb > 0 {
+            let ram_pct = (target.ram_used_mb * 100 / target.ram_total_mb).min(100);
+            ram_pct_cell.set(ram_pct);
+            ram_bar.queue_draw();
+            ram_val_lbl.set_text(&fmt_gb(target.ram_used_mb, target.ram_total_mb));
+        }
+
+        // VRAM bar
+        let valid_gpu = target.gpu_kind != GpuKind::Unknown;
+        if valid_gpu && target.vram_total_mb > 0 {
+            let vram_pct = (target.vram_used_mb * 100 / target.vram_total_mb).min(100);
+            vram_pct_cell.set(vram_pct);
+            vram_bar.queue_draw();
+            vram_val_lbl.set_text(&fmt_gb(target.vram_used_mb, target.vram_total_mb));
+            vram_row.set_visible(true);
+        } else {
+            vram_row.set_visible(false);
+        }
+
+        // Stats strip
+        let cpu_tc = temp_hex_color(target.cpu_temp);
+        let gpu_tc = temp_hex_color(target.gpu_temp);
+        cpu_stat_lbl.set_markup(&format!(
+            "<span foreground='#ff9f43'><b>CPU</b></span>  <span foreground='{}'>{:>3.0}°C</span>  <span foreground='#ffffff'>{:>5.1}W</span>",
+            cpu_tc, target.cpu_temp.floor(), target.cpu_watt
+        ));
+        gpu_stat_lbl.set_markup(&format!(
+            "<span foreground='#2ecc71'><b>GPU</b></span>  <span foreground='{}'>{:>3.0}°C</span>  <span foreground='#ffffff'>{:>5.1}W</span>",
+            gpu_tc, target.gpu_temp.floor(), target.gpu_watt
+        ));
+
+        // Process section
+        let has_media   = valid_gpu && !target.media_procs.is_empty();
+        let has_compute = valid_gpu && !target.compute_procs.is_empty();
+        let has_procs   = has_media || has_compute;
+
+        if has_procs {
+            proc_container.set_visible(true);
+
+            let mut combined: Vec<(String, Option<u32>, Option<u32>, Option<u32>, Option<u32>)> = Vec::new();
+            for (name, dec, enc, gfx) in &target.media_procs {
+                combined.push((name.clone(),
+                    if *gfx > 0 { Some(*gfx) } else { None },
+                    if *dec > 0 { Some(*dec) } else { None },
+                    if *enc > 0 { Some(*enc) } else { None },
+                    None));
+            }
+            for (name, sm) in &target.compute_procs {
+                let sv = if *sm > 0 { Some(*sm) } else { None };
+                if let Some(e) = combined.iter_mut().find(|(n, ..)| n == name) {
+                    e.4 = sv;
+                } else {
+                    combined.push((name.clone(), None, None, None, sv));
+                }
+            }
+
+            let trunc = |n: &str| -> String {
+                if n.chars().count() > 11 { format!("{}…", n.chars().take(10).collect::<String>()) }
+                else { n.to_string() }
+            };
+            let fmt_val = |v: Option<u32>| -> String {
+                match v {
+                    Some(x) if x > 0 => format!("{:>3}%", x),
+                    _ => "   —".to_string(),
+                }
+            };
+
+            proc_lbl.set_text(&combined.iter().map(|(n, ..)| trunc(n)).collect::<Vec<_>>().join("\n"));
+            gfx_lbl.set_text(&combined.iter().map(|(_, g, ..)| fmt_val(*g)).collect::<Vec<_>>().join("\n"));
+            dec_lbl.set_text(&combined.iter().map(|(_, _, d, ..)| fmt_val(*d)).collect::<Vec<_>>().join("\n"));
+            enc_lbl.set_text(&combined.iter().map(|(_, _, _, e, _)| fmt_val(*e)).collect::<Vec<_>>().join("\n"));
+            sm_lbl.set_text(&combined.iter().map(|(_, _, _, _, s)| fmt_val(*s)).collect::<Vec<_>>().join("\n"));
+        } else {
+            proc_container.set_visible(false);
+        }
+
+        sep2.set_visible(valid_gpu && (has_procs || target.vram_total_mb > 0));
+        glib::ControlFlow::Continue
+    });
 }
