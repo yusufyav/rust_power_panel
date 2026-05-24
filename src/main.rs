@@ -2235,11 +2235,12 @@ fn build_ui2(app: &Application) {
     sep_top.add_css_class("divider");
     panel.append(&sep_top);
 
-    // Bar rows: CPU, GPU (pct val), RAM, VRAM (GB val)
-    let (cpu_row, cpu_bar, cpu_pct_cell, cpu_val_lbl) = make_bar_row_2("CPU", "lbl-cpu", 5);
+    // Bar rows: CPU, GPU (pct val), RAM, VRAM (GB val).
+    // val_width_chars equal across rows so all bars get identical width.
+    let (cpu_row, cpu_bar, cpu_pct_cell, cpu_val_lbl) = make_bar_row_2("CPU", "lbl-cpu", 11);
     panel.append(&cpu_row);
 
-    let (gpu_row, gpu_bar, gpu_pct_cell, gpu_val_lbl) = make_bar_row_2("GPU", "lbl-gpu", 5);
+    let (gpu_row, gpu_bar, gpu_pct_cell, gpu_val_lbl) = make_bar_row_2("GPU", "lbl-gpu", 11);
     panel.append(&gpu_row);
 
     let (ram_row, ram_bar, ram_pct_cell, ram_val_lbl) = make_bar_row_2("RAM", "lbl-ram", 11);
@@ -2289,6 +2290,18 @@ fn build_ui2(app: &Application) {
     let win_clone = window.clone();
     gesture.connect_released(move |_, _, _, _| win_clone.close());
     window.add_controller(gesture);
+
+    let opacity = Rc::new(Cell::new(1.0_f64));
+    let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+    let win_op = window.clone();
+    let op_cell = opacity.clone();
+    scroll.connect_scroll(move |_, _, dy| {
+        let new = (op_cell.get() - dy * 0.05).clamp(0.3, 1.0);
+        op_cell.set(new);
+        win_op.set_opacity(new);
+        glib::Propagation::Stop
+    });
+    window.add_controller(scroll);
 
     window.present();
 
