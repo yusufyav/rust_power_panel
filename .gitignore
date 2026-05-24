@@ -4,9 +4,15 @@
 
 # ── Proje ────────────────────────────────────────────────────────────────────
 /wiki
-/CLAUDE.md
-/.claude
+/raw
 /.obsidian
+
+# ── AI / Agent konfigürasyonu (yerel, projeye dahil değil) ──────────────────
+/CLAUDE.md
+/AGENTS.md
+/.claude
+/.pirclocal
+/.pi-skills
 
 # ── Editör / IDE ─────────────────────────────────────────────────────────────
 *.swp
