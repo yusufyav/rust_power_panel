@@ -1,7 +1,7 @@
 # PowerPanel — Zig portu
 
-Rust `src/main.rs`'in **Zig 0.16** ile yazılmış klonu. Mevcut Rust uygulaması
-olduğu gibi durur (`../src/main.rs`); bu dizin bağımsız bir Zig
+Rust `rust/src/main.rs`'in **Zig 0.16** ile yazılmış klonu. Mevcut Rust uygulaması
+olduğu gibi durur (`../rust/src/main.rs`); bu dizin bağımsız bir Zig
 implementasyonudur.
 
 ## Durum
@@ -62,7 +62,7 @@ geliştirme paketleri gerekir. `-Dgui=false` ile bu bağımlılıklar tamamen d�
 
 | Binary | Boyut |
 |---|---|
-| Rust release (`target/release`) | ~1.0 MB |
+| Rust release (`rust/target/release`) | ~1.0 MB |
 | Zig ReleaseFast + strip (GUI dahil) | ~323 KB |
 | Zig ReleaseFast + strip (`-Dgui=false`) | ~343 KB |
 | Zig ReleaseSmall + strip (`-Dgui=false`) | ~111 KB |
