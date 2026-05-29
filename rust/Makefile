@@ -3,7 +3,7 @@
 # Kullanım: proje kökündeki rust/ dizininden çalıştırın.
 #   cd rust && make install
 
-.PHONY: all deps build run install uninstall clean permissions help
+.PHONY: all deps build server server-arm64 run install uninstall clean permissions help
 
 # ── Ayarlar ──────────────────────────────────────────────────────────────────
 BIN_NAME    = power_panel
@@ -19,6 +19,8 @@ help:
 	@echo "Çalıştırma dizini: rust/"
 	@echo "────────────────────────────────────────"
 	@echo "  make               Bağımlılıkları kontrol et + derle"
+	@echo "  make server        Statik musl binary — GUI yok, Proxmox/sunucu için"
+	@echo "  make server-arm64  ARM64 sunucu için statik musl binary"
 	@echo "  make run           Derle + çalıştır"
 	@echo "  make permissions   Sensör izinlerini kur (udev, tek seferlik)"
 	@echo "  make install       Sisteme kur (/usr/local/bin/$(BIN_NAME))"
@@ -68,6 +70,25 @@ build:
 	@echo "=> $(BIN_NAME) derleniyor (release)..."
 	@cargo build --release
 	@echo "=> Derleme tamamlandı: target/release/$(BIN_NAME)"
+
+# Proxmox/sunucu: GTK yok, musl ile tamamen statik binary
+server:
+	@command -v cargo > /dev/null 2>&1 \
+	  || { echo "❌ Rust/Cargo kurulu değil. Kurmak için: https://rustup.rs"; exit 1; }
+	@rustup target add x86_64-unknown-linux-musl 2>/dev/null || true
+	@cargo build --release --no-default-features --target x86_64-unknown-linux-musl
+	@echo "=> Sunucu binary'si hazır: target/x86_64-unknown-linux-musl/release/$(BIN_NAME)"
+	@echo "=> Proxmox'a kopyalamak için:"
+	@echo "   scp target/x86_64-unknown-linux-musl/release/$(BIN_NAME) root@<proxmox-ip>:/usr/local/bin/$(BIN_NAME)"
+
+server-arm64:
+	@command -v cargo > /dev/null 2>&1 \
+	  || { echo "❌ Rust/Cargo kurulu değil. Kurmak için: https://rustup.rs"; exit 1; }
+	@rustup target add aarch64-unknown-linux-musl 2>/dev/null || true
+	@cargo build --release --no-default-features --target aarch64-unknown-linux-musl
+	@echo "=> ARM64 sunucu binary'si hazır: target/aarch64-unknown-linux-musl/release/$(BIN_NAME)"
+	@echo "=> Proxmox'a kopyalamak için:"
+	@echo "   scp target/aarch64-unknown-linux-musl/release/$(BIN_NAME) root@<proxmox-ip>:/usr/local/bin/$(BIN_NAME)"
 
 # ── Sensör izinleri (udev — sudo gerektirmez) ─────────────────────────────────
 permissions:

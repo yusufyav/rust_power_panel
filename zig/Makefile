@@ -6,7 +6,7 @@
 # ⚠️  Rust ve Zig sürümleri aynı binary adını kullanır (power_panel).
 #    İkisi aynı anda kurulu olmamalı; biri kuruluyken diğeri kurulursa üzerine yazar.
 
-.PHONY: all build small run cli tui debug clean help permissions install uninstall
+.PHONY: all build small server server-arm64 run cli tui debug clean help permissions install uninstall
 
 # ── Ayarlar ──────────────────────────────────────────────────────────────────
 BIN_NAME     = power_panel
@@ -25,6 +25,8 @@ help:
 	@echo "────────────────────────────────────────"
 	@echo "  make               Derle (ReleaseFast)"
 	@echo "  make small         ReleaseSmall + strip (en küçük binary)"
+	@echo "  make server        Statik musl binary — GUI yok, Proxmox/sunucu için"
+	@echo "  make server-arm64  ARM64 sunucu için statik musl binary"
 	@echo "  make run           Derle + çalıştır (--gui)"
 	@echo "  make cli           CLI modunda çalıştır"
 	@echo "  make tui           TUI modunda çalıştır"
@@ -48,6 +50,23 @@ build:
 
 small:
 	@zig build -Doptimize=ReleaseSmall
+
+# Proxmox/sunucu: GTK yok, musl ile tamamen statik binary
+server:
+	@command -v zig > /dev/null 2>&1 \
+	  || { echo "❌ Zig kurulu değil. Kurun: https://ziglang.org/download"; exit 1; }
+	@zig build -Doptimize=ReleaseFast -Dgui=false -Dtarget=x86_64-linux-musl
+	@echo "=> Sunucu binary'si hazır: $(BIN)"
+	@echo "=> Proxmox'a kopyalamak için:"
+	@echo "   scp $(BIN) root@<proxmox-ip>:/usr/local/bin/power_panel"
+
+server-arm64:
+	@command -v zig > /dev/null 2>&1 \
+	  || { echo "❌ Zig kurulu değil. Kurun: https://ziglang.org/download"; exit 1; }
+	@zig build -Doptimize=ReleaseFast -Dgui=false -Dtarget=aarch64-linux-musl
+	@echo "=> ARM64 sunucu binary'si hazır: $(BIN)"
+	@echo "=> Proxmox'a kopyalamak için:"
+	@echo "   scp $(BIN) root@<proxmox-ip>:/usr/local/bin/power_panel"
 
 # ── Sensör izinleri (udev — sudo gerektirmez) ─────────────────────────────────
 permissions:
