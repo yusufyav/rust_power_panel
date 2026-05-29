@@ -1,22 +1,27 @@
+# PowerPanel — Rust uygulaması
+#
+# Kullanım: proje kökündeki rust/ dizininden çalıştırın.
+#   cd rust && make install
+
 .PHONY: all deps build run install uninstall clean permissions help
 
-# ── Proje ayarları ────────────────────────────────────────────────────────────
+# ── Ayarlar ──────────────────────────────────────────────────────────────────
 BIN_NAME    = power_panel
 INSTALL_DIR = /usr/local/bin
 UDEV_RULES  = /etc/udev/rules.d/99-$(BIN_NAME).rules
 
-# ── Varsayılan hedef ──────────────────────────────────────────────────────────
 all: deps build
 
 # ── Yardım ───────────────────────────────────────────────────────────────────
 help:
 	@echo ""
-	@echo "PowerPanel — Kullanılabilir Hedefler"
+	@echo "PowerPanel — Rust uygulaması"
+	@echo "Çalıştırma dizini: rust/"
 	@echo "────────────────────────────────────────"
-	@echo "  make               Bağımlılıkları kur + derle"
+	@echo "  make               Bağımlılıkları kontrol et + derle"
 	@echo "  make run           Derle + çalıştır"
 	@echo "  make permissions   Sensör izinlerini kur (udev, tek seferlik)"
-	@echo "  make install       Sisteme kur + izinleri ayarla"
+	@echo "  make install       Sisteme kur (/usr/local/bin/$(BIN_NAME))"
 	@echo "  make uninstall     Kurulumu kaldır"
 	@echo "  make clean         Build dosyalarını temizle"
 	@echo "  make help          Bu mesajı göster"
@@ -72,11 +77,8 @@ permissions:
 		echo "=> Sensör izinleri ayarlanıyor (udev kuralı)..."; \
 		printf '%s\n' \
 			'# $(BIN_NAME) — CPU/GPU güç ve sıcaklık sensörlerine kullanıcı erişimi' \
-			'# RAPL (CPU güç tüketimi — Intel ve AMD)' \
 			'SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/powercap/"' \
-			'# RAPL (CPU güç tüketimi — Intel ve AMD)' \
 			'SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/powercap/intel-rapl:0/"' \
-			'# hwmon (CPU/GPU sıcaklık sensörleri)' \
 			'SUBSYSTEM=="hwmon", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/hwmon/"' \
 			| sudo tee $(UDEV_RULES) > /dev/null; \
 		sudo chmod 0644 $(UDEV_RULES); \
@@ -96,32 +98,24 @@ run: build
 	@./target/release/$(BIN_NAME)
 
 # ── Kurulum ───────────────────────────────────────────────────────────────────
-# Klavye kısayolu kullanımına uygun: aç/kapat toggle script ile çalışır.
 install: build permissions
 	@echo ""
-	@echo "=> [1/2] Binary kuruluyor: $(INSTALL_DIR)/$(BIN_NAME)"
+	@echo "=> Binary kuruluyor: $(INSTALL_DIR)/$(BIN_NAME)"
 	@sudo cp target/release/$(BIN_NAME) $(INSTALL_DIR)/$(BIN_NAME)
 	@sudo chmod 0755 $(INSTALL_DIR)/$(BIN_NAME)
-	@# Eski _bin wrapper'ı temizle (geçmiş kurulumdan kalma)
 	@if [ -f "$(INSTALL_DIR)/$(BIN_NAME)_bin" ]; then \
-		echo "=> Eski wrapper binary temizleniyor..."; \
 		sudo rm -f $(INSTALL_DIR)/$(BIN_NAME)_bin; \
 	fi
 	@echo ""
-	@echo "=> [2/2] Kurulum tamamlandı! 🎉"
+	@echo "=> ✅ Kurulum tamamlandı!"
 	@echo ""
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo " KDE Plasma Klavye Kısayolu Kurulumu"
+	@echo " KDE Plasma Klavye Kısayolu (aç/kapat toggle)"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo ""
 	@echo " System Settings → Shortcuts → Custom Shortcuts"
 	@echo " → Edit → New → Global Shortcut → Command/URL"
 	@echo " Komut:"
 	@echo "   bash -c 'pgrep -x $(BIN_NAME) && pkill -x $(BIN_NAME) || $(INSTALL_DIR)/$(BIN_NAME)'"
-	@echo ""
-	@echo " Bu komut:"
-	@echo "   • Panel açıksa kapatır"
-	@echo "   • Panel kapalıysa açar"
 	@echo ""
 	@echo " Terminalde çalıştırmak için: $(BIN_NAME)"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -1,10 +1,14 @@
+# PowerPanel — Zig portu
+#
+# Kullanım: proje kökündeki zig/ dizininden çalıştırın.
+#   cd zig && make install
+#
+# Varsayılan kurulum adı: power_panel-zig
+# Aynı adla kurmak için: make install INSTALL_NAME=power_panel
+
 .PHONY: all build small run cli tui debug clean help permissions install uninstall
 
 # ── Ayarlar ──────────────────────────────────────────────────────────────────
-# BIN_NAME    : zig build çıktısının adı (build.zig'de sabit: power_panel)
-# INSTALL_NAME: sisteme kurulurken kullanılacak ad. Rust sürümüyle ÇAKIŞMAMASI
-#               için varsayılan "power_panel-zig". Rust sürümünün yerine kurmak
-#               için: make install INSTALL_NAME=power_panel
 BIN_NAME     = power_panel
 INSTALL_NAME = power_panel-zig
 INSTALL_DIR  = /usr/local/bin
@@ -13,33 +17,37 @@ BIN          = zig-out/bin/$(BIN_NAME)
 
 all: build
 
+# ── Yardım ───────────────────────────────────────────────────────────────────
 help:
 	@echo ""
-	@echo "PowerPanel (Zig portu) — Hedefler"
+	@echo "PowerPanel — Zig portu"
+	@echo "Çalıştırma dizini: zig/"
 	@echo "────────────────────────────────────────"
-	@echo "  make build        ReleaseFast + strip derle"
-	@echo "  make small        ReleaseSmall + strip (en küçük binary)"
-	@echo "  make run          Derle + çalıştır (--gui)"
-	@echo "  make cli          CLI modunda çalıştır"
-	@echo "  make tui          TUI modunda çalıştır"
-	@echo "  make debug        Sensör teşhisi"
-	@echo "  make permissions  Sensör izinlerini kur (udev, tek seferlik)"
-	@echo "  make install      Sisteme kur ($(INSTALL_NAME)) + izinler"
-	@echo "  make uninstall    Kurulumu kaldır"
-	@echo "  make clean        zig-out + .zig-cache temizle"
+	@echo "  make               Derle (ReleaseFast)"
+	@echo "  make small         ReleaseSmall + strip (en küçük binary)"
+	@echo "  make run           Derle + çalıştır (--gui)"
+	@echo "  make cli           CLI modunda çalıştır"
+	@echo "  make tui           TUI modunda çalıştır"
+	@echo "  make debug         Sensör teşhisi"
+	@echo "  make permissions   Sensör izinlerini kur (udev, tek seferlik)"
+	@echo "  make install       Sisteme kur (/usr/local/bin/$(INSTALL_NAME))"
+	@echo "  make uninstall     Kurulumu kaldır"
+	@echo "  make clean         zig-out + .zig-cache temizle"
+	@echo "  make help          Bu mesajı göster"
 	@echo ""
-	@echo "NOT: Rust sürümünün yerine kurmak için:"
-	@echo "     make install INSTALL_NAME=power_panel"
+	@echo "NOT: 'make run' öncesinde 'make permissions' yapılmamışsa"
+	@echo "     güç değerleri 0.0 W görünebilir (RAPL erişim sorunu)."
 	@echo ""
 
 # ── Derleme ───────────────────────────────────────────────────────────────────
 build:
 	@command -v zig > /dev/null 2>&1 \
 	  || { echo "❌ Zig kurulu değil. Kurun: https://ziglang.org/download"; exit 1; }
-	zig build -Doptimize=ReleaseFast
+	@zig build -Doptimize=ReleaseFast
+	@echo "=> Derleme tamamlandı: $(BIN)"
 
 small:
-	zig build -Doptimize=ReleaseSmall
+	@zig build -Doptimize=ReleaseSmall
 
 # ── Sensör izinleri (udev — sudo gerektirmez) ─────────────────────────────────
 permissions:
@@ -49,11 +57,8 @@ permissions:
 		echo "=> Sensör izinleri ayarlanıyor (udev kuralı)..."; \
 		printf '%s\n' \
 			'# $(INSTALL_NAME) — CPU/GPU güç ve sıcaklık sensörlerine kullanıcı erişimi' \
-			'# RAPL (CPU güç tüketimi — Intel ve AMD)' \
 			'SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/powercap/"' \
-			'# RAPL (CPU güç tüketimi — Intel ve AMD)' \
 			'SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/powercap/intel-rapl:0/"' \
-			'# hwmon (CPU/GPU sıcaklık sensörleri)' \
 			'SUBSYSTEM=="hwmon", ACTION=="add|change", RUN+="/bin/chmod -R o+r /sys/class/hwmon/"' \
 			| sudo tee $(UDEV_RULES) > /dev/null; \
 		sudo chmod 0644 $(UDEV_RULES); \
@@ -65,11 +70,11 @@ permissions:
 
 # ── Geliştirme: direkt çalıştır ───────────────────────────────────────────────
 run: build
-	@if [ ! -f "$(UDEV_RULES)" ] && [ ! -f "/etc/udev/rules.d/99-$(BIN_NAME).rules" ]; then \
+	@if [ ! -f "$(UDEV_RULES)" ]; then \
 		echo "⚠️  Sensör izinleri kurulu değil — güç değerleri 0.0 W görünebilir."; \
 		echo "   Düzeltmek için: make permissions"; \
 	fi
-	@echo "=> $(BIN_NAME) başlatılıyor (--gui)..."
+	@echo "=> $(INSTALL_NAME) başlatılıyor (--gui)..."
 	@./$(BIN)
 
 cli: build
@@ -87,6 +92,7 @@ install: build permissions
 	@echo "=> Binary kuruluyor: $(INSTALL_DIR)/$(INSTALL_NAME)"
 	@sudo cp $(BIN) $(INSTALL_DIR)/$(INSTALL_NAME)
 	@sudo chmod 0755 $(INSTALL_DIR)/$(INSTALL_NAME)
+	@echo ""
 	@echo "=> ✅ Kurulum tamamlandı!"
 	@echo ""
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -97,9 +103,9 @@ install: build permissions
 	@echo " Komut:"
 	@echo "   bash -c 'pgrep -x $(INSTALL_NAME) && pkill -x $(INSTALL_NAME) || $(INSTALL_DIR)/$(INSTALL_NAME)'"
 	@echo ""
-	@echo " Terminalde: $(INSTALL_NAME)        # --gui (etiketli panel)"
-	@echo "             $(INSTALL_NAME) --gui2 # bar panel"
-	@echo "             $(INSTALL_NAME) --cli  # terminal"
+	@echo " Terminalde: $(INSTALL_NAME)         # GUI (etiketli panel)"
+	@echo "             $(INSTALL_NAME) --gui2  # GUI (bar panel)"
+	@echo "             $(INSTALL_NAME) --cli   # terminal modu"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # ── Kaldırma ─────────────────────────────────────────────────────────────────
