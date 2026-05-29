@@ -3,14 +3,14 @@
 # Kullanım: proje kökündeki zig/ dizininden çalıştırın.
 #   cd zig && make install
 #
-# Varsayılan kurulum adı: power_panel-zig
-# Aynı adla kurmak için: make install INSTALL_NAME=power_panel
+# ⚠️  Rust ve Zig sürümleri aynı binary adını kullanır (power_panel).
+#    İkisi aynı anda kurulu olmamalı; biri kuruluyken diğeri kurulursa üzerine yazar.
 
 .PHONY: all build small run cli tui debug clean help permissions install uninstall
 
 # ── Ayarlar ──────────────────────────────────────────────────────────────────
 BIN_NAME     = power_panel
-INSTALL_NAME = power_panel-zig
+INSTALL_NAME = power_panel
 INSTALL_DIR  = /usr/local/bin
 UDEV_RULES   = /etc/udev/rules.d/99-$(INSTALL_NAME).rules
 BIN          = zig-out/bin/$(BIN_NAME)
