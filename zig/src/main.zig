@@ -27,6 +27,7 @@ const VERSION = "0.1.0";
 const DEFAULT_INTERVAL_SECS: f32 = 2.0;
 const MIN_INTERVAL_SECS: f32 = 0.1;
 const MAX_INTERVAL_SECS: f32 = 3600.0;
+const SENSOR_PRIME_DELAY_MS: u64 = 250;
 
 const ParsedArgs = struct {
     mode_arg: ?[]const u8 = null,
@@ -140,6 +141,8 @@ fn runLoop(mode: Mode, interval_ms: u32) void {
     var frame_buf: [65536]u8 = undefined;
     var frame = render.Frame{ .buf = &frame_buf };
     var mon = sensors.Monitor.init(std.heap.c_allocator);
+    _ = mon.sample();
+    os.sleepMs(SENSOR_PRIME_DELAY_MS);
 
     while (true) {
         const snap = mon.sample();

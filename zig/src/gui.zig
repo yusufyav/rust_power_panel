@@ -32,6 +32,8 @@ const LAYER_OVERLAY: c_uint = 3;
 const EDGE_RIGHT: c_uint = 1;
 const EDGE_TOP: c_uint = 2;
 const KEYBOARD_NONE: c_uint = 0;
+const SENSOR_PRIME_DELAY_MS: c_uint = 250;
+const GUI_FIRST_UPDATE_DELAY_MS: c_uint = 300;
 
 // İkonlar (nerd font — Rust main.rs ile birebir)
 const ICON_CPU = "\u{f4bc}";
@@ -653,6 +655,8 @@ const SwitchCtx = struct {
     stack: Obj = null,
     style_toggle: Obj = null,
     proc_footer: ProcFooter = .{},
+    last_snap: sensors.Snapshot = .{},
+    has_snap: bool = false,
 };
 
 var ctxS: SwitchCtx = .{};
@@ -679,12 +683,32 @@ fn onScrollSwitch(_: Obj, _: f64, dy: f64, _: ?*anyopaque) callconv(.c) c_int {
     return 1;
 }
 
+fn updateSwitchFromSnap(snap: *const sensors.Snapshot) void {
+    updateUi1(snap);
+    updateUi2(snap);
+    updateSharedProcs(&ctxS.proc_footer.proc, &snap.gpu, snap.gpu.kind != .unknown);
+}
+
+fn sampleFirstSwitch(_: ?*anyopaque) callconv(.c) c_int {
+    ctxS.last_snap = ctxS.mon.sample();
+    ctxS.has_snap = true;
+    return 0;
+}
+
 fn tickSwitch(_: ?*anyopaque) callconv(.c) c_int {
     var snap = ctxS.mon.sample();
-    updateUi1(&snap);
-    updateUi2(&snap);
-    updateSharedProcs(&ctxS.proc_footer.proc, &snap.gpu, snap.gpu.kind != .unknown);
+    updateSwitchFromSnap(&snap);
     return 1;
+}
+
+fn firstTickSwitch(_: ?*anyopaque) callconv(.c) c_int {
+    if (!ctxS.has_snap) {
+        ctxS.last_snap = ctxS.mon.sample();
+        ctxS.has_snap = true;
+    }
+    updateSwitchFromSnap(&ctxS.last_snap);
+    _ = g_timeout_add(g_interval_ms, tickSwitch, null);
+    return 0;
 }
 
 fn activateSwitch(app: *anyopaque, _: ?*anyopaque) callconv(.c) void {
@@ -732,7 +756,8 @@ fn activateSwitch(app: *anyopaque, _: ?*anyopaque) callconv(.c) void {
     gtk_widget_add_controller(window, scroll);
 
     gtk_window_present(window);
-    _ = g_timeout_add(g_interval_ms, tickSwitch, null);
+    _ = g_timeout_add(SENSOR_PRIME_DELAY_MS, sampleFirstSwitch, null);
+    _ = g_timeout_add(GUI_FIRST_UPDATE_DELAY_MS, firstTickSwitch, null);
 }
 
 fn runSwitchable(initial: GuiStyle, interval_ms: u32) void {
@@ -741,6 +766,7 @@ fn runSwitchable(initial: GuiStyle, interval_ms: u32) void {
     ctxS = .{ .style = initial };
     g_interval_ms = @intCast(interval_ms);
     ctxS.mon = sensors.Monitor.init(std.heap.c_allocator);
+    _ = ctxS.mon.sample();
     const app = gtk_application_new("com.github.yusufyav.power_panel", G_APPLICATION_DEFAULT_FLAGS);
     defer g_object_unref(app);
     _ = g_signal_connect_data(app, "activate", @as(GCallback, @ptrCast(&activateSwitch)), null, null, 0);
