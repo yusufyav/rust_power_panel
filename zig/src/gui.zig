@@ -78,6 +78,16 @@ extern fn gtk_box_new(orientation: c_uint, spacing: c_int) Obj;
 extern fn gtk_box_append(box: Obj, child: Obj) void;
 extern fn gtk_separator_new(orientation: c_uint) Obj;
 
+extern fn gtk_button_new_with_label(label: [*:0]const u8) Obj;
+extern fn gtk_button_set_label(button: Obj, label: [*:0]const u8) void;
+
+extern fn gtk_stack_new() Obj;
+extern fn gtk_stack_add_named(stack: Obj, child: Obj, name: [*:0]const u8) Obj;
+extern fn gtk_stack_set_visible_child_name(stack: Obj, name: [*:0]const u8) void;
+extern fn gtk_stack_set_transition_type(stack: Obj, transition: c_uint) void;
+extern fn gtk_stack_set_hhomogeneous(stack: Obj, homogeneous: c_int) void;
+extern fn gtk_stack_set_vhomogeneous(stack: Obj, homogeneous: c_int) void;
+
 extern fn gtk_label_new(text: ?[*:0]const u8) Obj;
 extern fn gtk_label_set_text(label: Obj, text: [*:0]const u8) void;
 extern fn gtk_label_set_markup(label: Obj, markup: [*:0]const u8) void;
@@ -108,44 +118,37 @@ extern fn cairo_fill(cr: Obj) void;
 // ── CSS ───────────────────────────────────────────────────────────────────────
 const FONT = "font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;";
 
-// build_ui (etiketli panel)
-const CSS1 =
+const PANEL_CSS =
     \\window { background-color: transparent; }
-    \\.panel { background-color: rgba(10, 10, 10, 0.80); border-radius: 18px; border: 1px solid rgba(255, 255, 255, 0.15); padding: 18px 24px; }
-    \\.total-watt { color: #00ffcc; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 26px; font-weight: bold; }
-    \\.lbl-cpu { color: #ff9f43; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; font-weight: bold; }
-    \\.lbl-gpu { color: #2ecc71; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; font-weight: bold; }
-    \\.lbl-util { color: #a29bfe; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; font-weight: bold; }
-    \\.val-watt { color: #ffffff; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
-    \\.val-temp { color: #ff4757; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
-    \\.val-temp-cool { color: #4cd964; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
-    \\.val-temp-warm { color: #ff9f43; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
-    \\.val-temp-hot { color: #ff4757; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
-    \\.lbl-ram { color: #00cec9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; font-weight: bold; }
-    \\.val-vram { color: #74b9ff; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; }
-    \\.val-proc { color: #b2bec3; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 13px; }
-    \\.proc-hdr { color: #a29bfe; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 13px; font-weight: bold; }
-    \\.proc-val { color: #b2bec3; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 12px; }
-    \\.proc-num { color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 12px; }
-    \\.val-pct { color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
-    \\.divider { background-color: rgba(255, 255, 255, 0.10); min-height: 1px; margin: 4px 0px; }
-;
-
-// build_ui2 (bar panel)
-const CSS2 =
-    \\window { background-color: transparent; }
-    \\.panel2 { background-color: rgba(10, 10, 10, 0.82); border-radius: 18px; border: 1px solid rgba(255, 255, 255, 0.15); padding: 14px 18px; }
-    \\.brand-lbl { color: #a0a8b0; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 13px; }
-    \\.total-watt { color: #00ffcc; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 22px; font-weight: bold; }
-    \\.lbl-cpu { color: #ff9f43; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; font-weight: bold; }
-    \\.lbl-gpu { color: #2ecc71; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; font-weight: bold; }
-    \\.lbl-ram { color: #00cec9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; font-weight: bold; }
-    \\.val-pct { color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 13px; }
-    \\.stat-lbl { font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 13px; }
-    \\.divider { background-color: rgba(255, 255, 255, 0.10); min-height: 1px; margin: 2px 0px; }
+    \\
+    \\.panel-card { background-color: rgba(10, 10, 10, 0.82); border-radius: 18px; border: 1px solid rgba(255, 255, 255, 0.15); padding: 14px 18px; }
+    \\
+    \\.style-toggle { color: #a0a8b0; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 11px; background-image: none; background-color: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px; box-shadow: none; padding: 1px 8px; min-height: 0; min-width: 0; }
+    \\.style-toggle:hover { background-image: none; background-color: rgba(255, 255, 255, 0.14); }
+    \\
     \\.proc-hdr { color: #a29bfe; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 12px; font-weight: bold; }
     \\.proc-val { color: #b2bec3; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 12px; }
     \\.proc-num { color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 12px; }
+    \\.divider { background-color: rgba(255, 255, 255, 0.10); min-height: 1px; margin: 4px 0px; }
+    \\
+    \\.panel .total-watt { color: #00ffcc; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 26px; font-weight: bold; }
+    \\.panel .lbl-cpu { color: #ff9f43; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; font-weight: bold; }
+    \\.panel .lbl-gpu { color: #2ecc71; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; font-weight: bold; }
+    \\.panel .val-watt { color: #ffffff; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
+    \\.panel .val-temp-cool { color: #4cd964; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
+    \\.panel .val-temp-warm { color: #ff9f43; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
+    \\.panel .val-temp-hot { color: #ff4757; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
+    \\.panel .lbl-ram { color: #00cec9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; font-weight: bold; }
+    \\.panel .val-vram { color: #74b9ff; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; }
+    \\.panel .val-pct { color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
+    \\
+    \\.panel2 .brand-lbl { color: #a0a8b0; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 13px; }
+    \\.panel2 .total-watt { color: #00ffcc; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 22px; font-weight: bold; }
+    \\.panel2 .lbl-cpu { color: #ff9f43; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; font-weight: bold; }
+    \\.panel2 .lbl-gpu { color: #2ecc71; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; font-weight: bold; }
+    \\.panel2 .lbl-ram { color: #00cec9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; font-weight: bold; }
+    \\.panel2 .val-pct { color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 13px; }
+    \\.panel2 .stat-lbl { font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 13px; }
 ;
 
 // ── Paylaşılan yardımcılar ───────────────────────────────────────────────────
@@ -159,6 +162,39 @@ fn divider(margin_class: [*:0]const u8) Obj {
     const sep = gtk_separator_new(ORIENTATION_HORIZONTAL);
     gtk_widget_add_css_class(sep, margin_class);
     return sep;
+}
+
+const GuiStyle = enum {
+    classic,
+    bars,
+
+    fn next(self: GuiStyle) GuiStyle {
+        return switch (self) {
+            .classic => .bars,
+            .bars => .classic,
+        };
+    }
+
+    fn labelText(self: GuiStyle) [*:0]const u8 {
+        return switch (self) {
+            .classic => "⟳ Classic",
+            .bars => "⟳ Bars",
+        };
+    }
+
+    fn stackName(self: GuiStyle) [*:0]const u8 {
+        return switch (self) {
+            .classic => "classic",
+            .bars => "bars",
+        };
+    }
+};
+
+fn makeStyleToggle(text: [*:0]const u8) Obj {
+    const b = gtk_button_new_with_label(text);
+    gtk_widget_add_css_class(b, "style-toggle");
+    gtk_widget_set_halign(b, ALIGN_START);
+    return b;
 }
 
 fn setClasses(widget: Obj, cls: [*:0]const u8) void {
@@ -308,73 +344,94 @@ fn appendVal(buf: *Buf, v: ?u32) void {
     buf.raw("   —");
 }
 
-// Proc tablosunu doldur + container/separator görünürlüğünü ayarla.
-fn updateProcs(pw: *const ProcWidgets, sep: Obj, gpu: *const sensors.GpuData, valid_gpu: bool) void {
+const ProcFooter = struct {
+    root: Obj = null,
+    toggle: Obj = null,
+    proc: ProcWidgets = .{},
+};
+
+fn makeProcFooter() ProcFooter {
+    const footer = gtk_box_new(ORIENTATION_VERTICAL, 6);
+    gtk_box_append(footer, divider("divider"));
+
+    const toggle = makeStyleToggle("\u{f1a09}");
+    gtk_box_append(footer, toggle);
+
+    const pw = makeProcSection();
+    gtk_widget_set_visible(pw.container, 0);
+    gtk_box_append(footer, pw.container);
+
+    return .{ .root = footer, .toggle = toggle, .proc = pw };
+}
+
+fn clearProcLabels(pw: *const ProcWidgets) void {
+    gtk_label_set_text(pw.proc, "");
+    gtk_label_set_text(pw.gfx, "");
+    gtk_label_set_text(pw.dec, "");
+    gtk_label_set_text(pw.enc, "");
+    gtk_label_set_text(pw.sm, "");
+}
+
+fn updateSharedProcs(pw: *const ProcWidgets, gpu: *const sensors.GpuData, valid_gpu: bool) void {
     const has_media = valid_gpu and gpu.media_len > 0;
     const has_compute = valid_gpu and gpu.compute_len > 0;
-    const has_procs = has_media or has_compute;
-
-    if (has_procs) {
-        gtk_widget_set_visible(pw.container, 1);
-
-        var combined: [sensors.MAX_PROCS * 2]Combined = undefined;
-        var n: usize = 0;
-        for (gpu.mediaSlice()) |*m| {
-            if (n >= combined.len) break;
-            combined[n] = .{
-                .name = m.name(),
-                .gfx = if (m.gfx > 0) m.gfx else null,
-                .dec = if (m.dec > 0) m.dec else null,
-                .enc = if (m.enc > 0) m.enc else null,
-            };
-            n += 1;
-        }
-        for (gpu.computeSlice()) |*cp| {
-            const sv: ?u32 = if (cp.sm > 0) cp.sm else null;
-            var found = false;
-            for (combined[0..n]) |*e| {
-                if (std.mem.eql(u8, e.name, cp.name())) {
-                    e.sm = sv;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found and n < combined.len) {
-                combined[n] = .{ .name = cp.name(), .sm = sv };
-                n += 1;
-            }
-        }
-
-        var names: Buf = .{};
-        var gfxs: Buf = .{};
-        var decs: Buf = .{};
-        var encs: Buf = .{};
-        var sms: Buf = .{};
-        for (combined[0..n], 0..) |e, i| {
-            if (i > 0) {
-                names.raw("\n");
-                gfxs.raw("\n");
-                decs.raw("\n");
-                encs.raw("\n");
-                sms.raw("\n");
-            }
-            appendTrunc(&names, e.name);
-            appendVal(&gfxs, e.gfx);
-            appendVal(&decs, e.dec);
-            appendVal(&encs, e.enc);
-            appendVal(&sms, e.sm);
-        }
-        gtk_label_set_text(pw.proc, names.z());
-        gtk_label_set_text(pw.gfx, gfxs.z());
-        gtk_label_set_text(pw.dec, decs.z());
-        gtk_label_set_text(pw.enc, encs.z());
-        gtk_label_set_text(pw.sm, sms.z());
-    } else {
-        gtk_widget_set_visible(pw.container, 0);
+    if (!(has_media or has_compute)) {
+        clearProcLabels(pw);
+        return;
     }
 
-    const sep_vis: c_int = if (valid_gpu and (has_procs or gpu.vram_total_mb > 0)) 1 else 0;
-    gtk_widget_set_visible(sep, sep_vis);
+    var combined: [sensors.MAX_PROCS * 2]Combined = undefined;
+    var n: usize = 0;
+    for (gpu.mediaSlice()) |*m| {
+        if (n >= combined.len) break;
+        combined[n] = .{
+            .name = m.name(),
+            .gfx = if (m.gfx > 0) m.gfx else null,
+            .dec = if (m.dec > 0) m.dec else null,
+            .enc = if (m.enc > 0) m.enc else null,
+        };
+        n += 1;
+    }
+    for (gpu.computeSlice()) |*cp| {
+        const sv: ?u32 = if (cp.sm > 0) cp.sm else null;
+        var found = false;
+        for (combined[0..n]) |*e| {
+            if (std.mem.eql(u8, e.name, cp.name())) {
+                e.sm = sv;
+                found = true;
+                break;
+            }
+        }
+        if (!found and n < combined.len) {
+            combined[n] = .{ .name = cp.name(), .sm = sv };
+            n += 1;
+        }
+    }
+
+    var names: Buf = .{};
+    var gfxs: Buf = .{};
+    var decs: Buf = .{};
+    var encs: Buf = .{};
+    var sms: Buf = .{};
+    for (combined[0..n], 0..) |e, i| {
+        if (i > 0) {
+            names.raw("\n");
+            gfxs.raw("\n");
+            decs.raw("\n");
+            encs.raw("\n");
+            sms.raw("\n");
+        }
+        appendTrunc(&names, e.name);
+        appendVal(&gfxs, e.gfx);
+        appendVal(&decs, e.dec);
+        appendVal(&encs, e.enc);
+        appendVal(&sms, e.sm);
+    }
+    gtk_label_set_text(pw.proc, names.z());
+    gtk_label_set_text(pw.gfx, gfxs.z());
+    gtk_label_set_text(pw.dec, decs.z());
+    gtk_label_set_text(pw.enc, encs.z());
+    gtk_label_set_text(pw.sm, sms.z());
 }
 
 // Sağ tık → pencereyi kapat (data = pencere).
@@ -497,26 +554,10 @@ fn makeBarRow(lbl_text: [*:0]const u8, lbl_css: [*:0]const u8, bar_out: *Obj, va
     return row;
 }
 
-fn onScroll(_: Obj, _: f64, dy: f64, data: ?*anyopaque) callconv(.c) c_int {
-    _ = data;
-    var n = ctx2.opacity - dy * 0.05;
-    if (n < 0.3) n = 0.3;
-    if (n > 1.0) n = 1.0;
-    ctx2.opacity = n;
-    gtk_widget_set_opacity(ctx2.window, n);
-    return 1; // Propagation::Stop
-}
-
-fn activate2(app: *anyopaque, _: ?*anyopaque) callconv(.c) void {
-    const window = makeWindow(app);
-    ctx2.window = window;
-    loadCss(CSS2);
-
+fn buildBarsContent() Obj {
     const panel = gtk_box_new(ORIENTATION_VERTICAL, 6);
     gtk_widget_add_css_class(panel, "panel2");
-    gtk_widget_set_size_request(panel, 340, -1);
 
-    // Başlık satırı
     const title_row = gtk_box_new(ORIENTATION_HORIZONTAL, 0);
     const brand = label("PowerPanel", "brand-lbl");
     gtk_widget_set_hexpand(brand, 1);
@@ -539,7 +580,6 @@ fn activate2(app: *anyopaque, _: ?*anyopaque) callconv(.c) void {
 
     gtk_box_append(panel, divider("divider"));
 
-    // Stats strip
     const stats_row = gtk_box_new(ORIENTATION_HORIZONTAL, 0);
     ctx2.cpu_stat = label(null, "stat-lbl");
     gtk_label_set_use_markup(ctx2.cpu_stat, 1);
@@ -554,38 +594,7 @@ fn activate2(app: *anyopaque, _: ?*anyopaque) callconv(.c) void {
     gtk_box_append(stats_row, ctx2.gpu_stat);
     gtk_box_append(panel, stats_row);
 
-    ctx2.sep2 = divider("divider");
-    gtk_widget_set_visible(ctx2.sep2, 0);
-    gtk_box_append(panel, ctx2.sep2);
-    ctx2.proc = makeProcSection();
-    gtk_widget_set_visible(ctx2.proc.container, 0);
-    gtk_box_append(panel, ctx2.proc.container);
-
-    gtk_window_set_child(window, panel);
-
-    const gesture = gtk_gesture_click_new();
-    gtk_gesture_single_set_button(gesture, 3);
-    _ = g_signal_connect_data(gesture, "released", @as(GCallback, @ptrCast(&onReleased)), window, null, 0);
-    gtk_widget_add_controller(window, gesture);
-
-    const scroll = gtk_event_controller_scroll_new(SCROLL_VERTICAL);
-    _ = g_signal_connect_data(scroll, "scroll", @as(GCallback, @ptrCast(&onScroll)), null, null, 0);
-    gtk_widget_add_controller(window, scroll);
-
-    gtk_window_present(window);
-    _ = g_timeout_add(200, tick2, null);
-}
-
-fn tick2(_: ?*anyopaque) callconv(.c) c_int {
-    ctx2.loop_count += 1;
-    ctx2.gfx_max = @max(ctx2.gfx_max, ctx2.mon.quickGfx());
-    if (ctx2.loop_count % 5 == 1) {
-        var snap = ctx2.mon.sample();
-        snap.gpu.gfx_percent = @max(snap.gpu.gfx_percent, ctx2.gfx_max);
-        ctx2.gfx_max = 0;
-        updateUi2(&snap);
-    }
-    return 1;
+    return panel;
 }
 
 fn updateUi2(snap: *const sensors.Snapshot) void {
@@ -632,17 +641,114 @@ fn updateUi2(snap: *const sensors.Snapshot) void {
     var gb: Buf = .{};
     gb.print("<span foreground='#2ecc71'><b>GPU</b></span>  <span foreground='{s}'>{d:>3}°C</span>  <span foreground='#ffffff'>{d:>5.1}W</span>", .{ tempHex(gpu.temp), floorTemp(gpu.temp), gpu.watt });
     gtk_label_set_markup(ctx2.gpu_stat, gb.z());
-
-    updateProcs(&ctx2.proc, ctx2.sep2, gpu, valid_gpu);
 }
 
-pub fn run2() void {
+const SwitchCtx = struct {
+    mon: sensors.Monitor = undefined,
+    opacity: f64 = 1.0,
+    style: GuiStyle = .classic,
+    proc_expanded: bool = false,
+
+    window: Obj = null,
+    stack: Obj = null,
+    style_toggle: Obj = null,
+    proc_footer: ProcFooter = .{},
+};
+
+var ctxS: SwitchCtx = .{};
+var g_interval_ms: c_uint = 2000;
+
+fn onStyleClicked(_: Obj, _: ?*anyopaque) callconv(.c) void {
+    ctxS.style = ctxS.style.next();
+    gtk_stack_set_visible_child_name(ctxS.stack, ctxS.style.stackName());
+    gtk_button_set_label(ctxS.style_toggle, ctxS.style.labelText());
+}
+
+fn onProcToggle(_: Obj, _: ?*anyopaque) callconv(.c) void {
+    ctxS.proc_expanded = !ctxS.proc_expanded;
+    gtk_widget_set_visible(ctxS.proc_footer.proc.container, if (ctxS.proc_expanded) 1 else 0);
+    gtk_button_set_label(ctxS.proc_footer.toggle, if (ctxS.proc_expanded) "\u{f1a0a}" else "\u{f1a09}");
+}
+
+fn onScrollSwitch(_: Obj, _: f64, dy: f64, _: ?*anyopaque) callconv(.c) c_int {
+    var n = ctxS.opacity - dy * 0.05;
+    if (n < 0.3) n = 0.3;
+    if (n > 1.0) n = 1.0;
+    ctxS.opacity = n;
+    gtk_widget_set_opacity(ctxS.window, n);
+    return 1;
+}
+
+fn tickSwitch(_: ?*anyopaque) callconv(.c) c_int {
+    var snap = ctxS.mon.sample();
+    updateUi1(&snap);
+    updateUi2(&snap);
+    updateSharedProcs(&ctxS.proc_footer.proc, &snap.gpu, snap.gpu.kind != .unknown);
+    return 1;
+}
+
+fn activateSwitch(app: *anyopaque, _: ?*anyopaque) callconv(.c) void {
+    const window = makeWindow(app);
+    ctxS.window = window;
+    loadCss(PANEL_CSS);
+
+    const card = gtk_box_new(ORIENTATION_VERTICAL, 8);
+    gtk_widget_add_css_class(card, "panel-card");
+    gtk_widget_set_size_request(card, 340, -1);
+
+    const header = gtk_box_new(ORIENTATION_HORIZONTAL, 0);
+    ctxS.style_toggle = makeStyleToggle(ctxS.style.labelText());
+    gtk_box_append(header, ctxS.style_toggle);
+    gtk_box_append(card, header);
+
+    const classic_root = buildClassicContent();
+    const bars_root = buildBarsContent();
+
+    const stack = gtk_stack_new();
+    ctxS.stack = stack;
+    gtk_stack_set_transition_type(stack, 0);
+    gtk_stack_set_hhomogeneous(stack, 0);
+    gtk_stack_set_vhomogeneous(stack, 0);
+    _ = gtk_stack_add_named(stack, classic_root, "classic");
+    _ = gtk_stack_add_named(stack, bars_root, "bars");
+    gtk_stack_set_visible_child_name(stack, ctxS.style.stackName());
+    gtk_box_append(card, stack);
+
+    ctxS.proc_footer = makeProcFooter();
+    gtk_box_append(card, ctxS.proc_footer.root);
+
+    _ = g_signal_connect_data(ctxS.style_toggle, "clicked", @as(GCallback, @ptrCast(&onStyleClicked)), null, null, 0);
+    _ = g_signal_connect_data(ctxS.proc_footer.toggle, "clicked", @as(GCallback, @ptrCast(&onProcToggle)), null, null, 0);
+
+    gtk_window_set_child(window, card);
+
+    const gesture = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(gesture, 3);
+    _ = g_signal_connect_data(gesture, "released", @as(GCallback, @ptrCast(&onReleased)), window, null, 0);
+    gtk_widget_add_controller(window, gesture);
+
+    const scroll = gtk_event_controller_scroll_new(SCROLL_VERTICAL);
+    _ = g_signal_connect_data(scroll, "scroll", @as(GCallback, @ptrCast(&onScrollSwitch)), null, null, 0);
+    gtk_widget_add_controller(window, scroll);
+
+    gtk_window_present(window);
+    _ = g_timeout_add(g_interval_ms, tickSwitch, null);
+}
+
+fn runSwitchable(initial: GuiStyle, interval_ms: u32) void {
+    ctx1 = .{};
     ctx2 = .{};
-    ctx2.mon = sensors.Monitor.init(std.heap.c_allocator);
+    ctxS = .{ .style = initial };
+    g_interval_ms = @intCast(interval_ms);
+    ctxS.mon = sensors.Monitor.init(std.heap.c_allocator);
     const app = gtk_application_new("com.github.yusufyav.power_panel", G_APPLICATION_DEFAULT_FLAGS);
     defer g_object_unref(app);
-    _ = g_signal_connect_data(app, "activate", @as(GCallback, @ptrCast(&activate2)), null, null, 0);
+    _ = g_signal_connect_data(app, "activate", @as(GCallback, @ptrCast(&activateSwitch)), null, null, 0);
     _ = g_application_run(app, 0, null);
+}
+
+pub fn run2(interval_ms: u32) void {
+    runSwitchable(.bars, interval_ms);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -762,14 +868,9 @@ fn makeVramRow(vram_out: *Obj, pct_out: *Obj) Obj {
     return row;
 }
 
-fn activate1(app: *anyopaque, _: ?*anyopaque) callconv(.c) void {
-    const window = makeWindow(app);
-    ctx1.window = window;
-    loadCss(CSS1);
-
+fn buildClassicContent() Obj {
     const panel = gtk_box_new(ORIENTATION_VERTICAL, 8);
     gtk_widget_add_css_class(panel, "panel");
-    gtk_widget_set_size_request(panel, 340, -1);
 
     ctx1.total_label = label("⚡    0.0 W", "total-watt");
     gtk_widget_set_halign(ctx1.total_label, ALIGN_CENTER);
@@ -782,35 +883,7 @@ fn activate1(app: *anyopaque, _: ?*anyopaque) callconv(.c) void {
     gtk_widget_set_visible(ctx1.vram_row, 0);
     gtk_box_append(panel, ctx1.vram_row);
 
-    ctx1.sep = divider("divider");
-    gtk_widget_set_visible(ctx1.sep, 0);
-    gtk_box_append(panel, ctx1.sep);
-
-    ctx1.proc = makeProcSection();
-    gtk_widget_set_visible(ctx1.proc.container, 0);
-    gtk_box_append(panel, ctx1.proc.container);
-
-    gtk_window_set_child(window, panel);
-
-    const gesture = gtk_gesture_click_new();
-    gtk_gesture_single_set_button(gesture, 3);
-    _ = g_signal_connect_data(gesture, "released", @as(GCallback, @ptrCast(&onReleased)), window, null, 0);
-    gtk_widget_add_controller(window, gesture);
-
-    gtk_window_present(window);
-    _ = g_timeout_add(200, tick1, null);
-}
-
-fn tick1(_: ?*anyopaque) callconv(.c) c_int {
-    ctx1.loop_count += 1;
-    ctx1.gfx_max = @max(ctx1.gfx_max, ctx1.mon.quickGfx());
-    if (ctx1.loop_count % 5 == 1) {
-        var snap = ctx1.mon.sample();
-        snap.gpu.gfx_percent = @max(snap.gpu.gfx_percent, ctx1.gfx_max);
-        ctx1.gfx_max = 0;
-        updateUi1(&snap);
-    }
-    return 1;
+    return panel;
 }
 
 fn updateUi1(snap: *const sensors.Snapshot) void {
@@ -880,14 +953,8 @@ fn updateUi1(snap: *const sensors.Snapshot) void {
         gtk_widget_set_visible(ctx1.vram_row, 0);
     }
 
-    updateProcs(&ctx1.proc, ctx1.sep, gpu, valid_gpu);
 }
 
-pub fn run1() void {
-    ctx1 = .{};
-    ctx1.mon = sensors.Monitor.init(std.heap.c_allocator);
-    const app = gtk_application_new("com.github.yusufyav.power_panel", G_APPLICATION_DEFAULT_FLAGS);
-    defer g_object_unref(app);
-    _ = g_signal_connect_data(app, "activate", @as(GCallback, @ptrCast(&activate1)), null, null, 0);
-    _ = g_application_run(app, 0, null);
+pub fn run1(interval_ms: u32) void {
+    runSwitchable(.classic, interval_ms);
 }

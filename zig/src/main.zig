@@ -13,37 +13,47 @@ const build_options = @import("build_options");
 // GUI yalnızca -Dgui=true (varsayılan) derlemede dahil edilir; aksi halde
 // gtk hiç derlenmez (lean CLI/TUI/debug binary).
 const gui = if (build_options.gui) @import("gui.zig") else struct {
-    pub fn run1() void {
+    pub fn run1(interval_ms: u32) void {
+        _ = interval_ms;
         os.stdout("⚠️  Bu binary -Dgui=false ile derlendi; GUI yok.\n");
     }
-    pub fn run2() void {
+    pub fn run2(interval_ms: u32) void {
+        _ = interval_ms;
         os.stdout("⚠️  Bu binary -Dgui=false ile derlendi; GUI yok.\n");
     }
 };
 
 const VERSION = "0.1.0";
+const DEFAULT_INTERVAL_SECS: f32 = 2.0;
+const MIN_INTERVAL_SECS: f32 = 0.1;
+const MAX_INTERVAL_SECS: f32 = 3600.0;
+
+const ParsedArgs = struct {
+    mode_arg: ?[]const u8 = null,
+    interval_ms: u32 = 2000,
+};
 
 pub fn main(init: std.process.Init.Minimal) void {
     var args = init.args.iterate();
     _ = args.next(); // argv[0]
-    const first = args.next();
+    const parsed = parseArgs(&args);
 
-    if (first) |arg| {
+    if (parsed.mode_arg) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
         } else if (std.mem.eql(u8, arg, "--cli")) {
-            runLoop(.cli);
+            runLoop(.cli, parsed.interval_ms);
         } else if (std.mem.eql(u8, arg, "--tui")) {
-            runLoop(.tui);
+            runLoop(.tui, parsed.interval_ms);
         } else if (std.mem.eql(u8, arg, "--debug")) {
             runDiagnostics();
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             os.stdout("PowerPanel v" ++ VERSION ++ "\n");
             os.stdout("Minimal power monitoring tool for Linux\n");
         } else if (std.mem.eql(u8, arg, "--gui2")) {
-            gui.run2();
+            gui.run2(parsed.interval_ms);
         } else if (std.mem.eql(u8, arg, "--gui")) {
-            gui.run1();
+            gui.run1(parsed.interval_ms);
         } else {
             var buf: [256]u8 = undefined;
             os.stdout(std.fmt.bufPrint(&buf, "❌ Bilinmeyen parametre: {s}\n", .{arg}) catch "");
@@ -53,12 +63,80 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     // Argümansız: Rust varsayılanı build_ui → gui1 (etiketli panel) başlat.
-    gui.run1();
+    gui.run1(parsed.interval_ms);
+}
+
+fn parseArgs(args: anytype) ParsedArgs {
+    var parsed = ParsedArgs{};
+    var interval_secs = DEFAULT_INTERVAL_SECS;
+    var pending: ?[]const u8 = null;
+
+    while (true) {
+        const arg = if (pending) |p| blk: {
+            pending = null;
+            break :blk p;
+        } else args.next() orelse break;
+
+        if (std.mem.eql(u8, arg, "--interval")) {
+            if (args.next()) |value| {
+                if (isControlArg(value)) {
+                    warnInvalidInterval();
+                    interval_secs = DEFAULT_INTERVAL_SECS;
+                    pending = value;
+                } else {
+                    interval_secs = parseIntervalSecs(value);
+                }
+            } else {
+                warnInvalidInterval();
+                interval_secs = DEFAULT_INTERVAL_SECS;
+            }
+        } else if (parsed.mode_arg == null) {
+            parsed.mode_arg = arg;
+        }
+    }
+
+    parsed.interval_ms = intervalMs(interval_secs);
+    return parsed;
+}
+
+fn isControlArg(value: []const u8) bool {
+    return std.mem.eql(u8, value, "--help") or
+        std.mem.eql(u8, value, "-h") or
+        std.mem.eql(u8, value, "--version") or
+        std.mem.eql(u8, value, "-v") or
+        std.mem.eql(u8, value, "--cli") or
+        std.mem.eql(u8, value, "--tui") or
+        std.mem.eql(u8, value, "--gui") or
+        std.mem.eql(u8, value, "--gui2") or
+        std.mem.eql(u8, value, "--debug") or
+        std.mem.eql(u8, value, "--interval");
+}
+
+fn parseIntervalSecs(value: []const u8) f32 {
+    const parsed = std.fmt.parseFloat(f32, value) catch {
+        warnInvalidInterval();
+        return DEFAULT_INTERVAL_SECS;
+    };
+    if (!std.math.isFinite(parsed) or parsed <= 0.0) {
+        warnInvalidInterval();
+        return DEFAULT_INTERVAL_SECS;
+    }
+    if (parsed < MIN_INTERVAL_SECS) return MIN_INTERVAL_SECS;
+    if (parsed > MAX_INTERVAL_SECS) return MAX_INTERVAL_SECS;
+    return parsed;
+}
+
+fn intervalMs(interval_secs: f32) u32 {
+    return @intFromFloat(interval_secs * 1000.0);
+}
+
+fn warnInvalidInterval() void {
+    os.writeAll(2, "Geçersiz --interval değeri; varsayılan 2.0 sn kullanılacak\n");
 }
 
 const Mode = enum { cli, tui };
 
-fn runLoop(mode: Mode) void {
+fn runLoop(mode: Mode, interval_ms: u32) void {
     var frame_buf: [65536]u8 = undefined;
     var frame = render.Frame{ .buf = &frame_buf };
     var mon = sensors.Monitor.init(std.heap.c_allocator);
@@ -70,7 +148,7 @@ fn runLoop(mode: Mode) void {
             .tui => render.renderTui(&frame, &snap),
         }
         os.stdout(frame.slice());
-        os.sleepMs(1000);
+        os.sleepMs(interval_ms);
     }
 }
 
@@ -86,6 +164,7 @@ fn printHelp() void {
         \\  --version, -v    Versiyon bilgisini gösterir
         \\  --cli            CLI (Terminal) modunda çalıştır
         \\  --tui            TUI (Bar görünümlü) modunda çalıştır
+        \\  --interval <saniye>  Güncelleme aralığı (varsayılan: 2.0)
         \\  --debug          Sensör teşhisini çalıştır ve çık
         \\
         \\ÖRNEKLER:
