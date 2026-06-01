@@ -2,7 +2,7 @@ use super::cli::{cli_row, cli_temp_color, cli_titled_sep};
 use crate::gpu::{detect_gpu, read_gpu_data, FdInfoTracker, GpuBackend, IntelFdInfoTracker};
 use crate::sensors::{detect_cpu_temp_path, find_rapl_path, read_u64};
 use crate::types::{usage_percent, CombinedProc, GpuData, GpuKind, GpuPowerTracker, PowerTracker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use sysinfo::System;
 
 fn render_bar(pct: u32, width: usize) -> (String, String) {
@@ -258,11 +258,17 @@ fn render_tui_frame(
     }
 
     println!("{bot}");
-    io::stdout().flush().unwrap();
+    let _ = io::stdout().flush();
 }
 
-pub(crate) fn run_tui_mode() {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+pub(crate) fn run_tui_mode(interval: Duration) {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Tokio runtime başlatılamadı: {e}");
+            std::process::exit(1);
+        }
+    };
     rt.block_on(async {
         let gpu_backend = detect_gpu();
         let mut sys = System::new();
@@ -347,7 +353,7 @@ pub(crate) fn run_tui_mode() {
                 ram_total_mb,
             );
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(interval).await;
         }
     });
 }
