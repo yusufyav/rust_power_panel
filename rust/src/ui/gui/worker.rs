@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Components, System};
 
+const SENSOR_PRIME_DELAY: Duration = Duration::from_millis(250);
+
 // ── Sensör thread (her iki stil için ortak) ──────────────────────────────────
 
 pub(super) fn spawn_sensor_thread(data_writer: Arc<Mutex<SensorData>>, interval: Duration) {
@@ -46,6 +48,8 @@ pub(super) fn spawn_sensor_thread(data_writer: Arc<Mutex<SensorData>>, interval:
             if let Some(p) = tracker.path {
                 tracker.last_energy = read_u64(p).unwrap_or(0);
             }
+            sys.refresh_cpu_usage();
+            tracker.last_time = Instant::now();
 
             // TEŞHİS MOTORUNU ÇALIŞTIRIYORUZ
             #[cfg(debug_assertions)]
@@ -53,6 +57,8 @@ pub(super) fn spawn_sensor_thread(data_writer: Arc<Mutex<SensorData>>, interval:
 
             // CPU sıcaklık sensörünü kernel'den direkt okumak için
             let cpu_temp_path = detect_cpu_temp_path();
+
+            tokio::time::sleep(SENSOR_PRIME_DELAY).await;
 
             let gfx_sample_interval = Duration::from_millis(200);
             let mut last_gfx_sample: Option<Instant> = None;

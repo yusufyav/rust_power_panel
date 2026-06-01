@@ -23,6 +23,8 @@ use std::time::Duration;
 // Bir stil içeriği: kök widget + her-tick güncelleme closure'ı.
 type Content = (GtkBox, Box<dyn Fn(&SensorData)>);
 
+const GUI_FIRST_UPDATE_DELAY: Duration = Duration::from_millis(300);
+
 // ── Stil-geçişli pencere (ortak iskelet) ─────────────────────────────────────
 
 fn build_switchable_ui(app: &Application, initial: GuiStyle, interval: Duration) {
@@ -119,16 +121,32 @@ fn build_switchable_ui(app: &Application, initial: GuiStyle, interval: Duration)
 
     window.present();
 
-    // Tek güncelleme döngüsü her iki içeriği ve process bölümünü besler.
-    glib::timeout_add_local(interval, move || {
-        let target = match data.lock() {
-            Ok(d) => d.clone(),
-            Err(_) => return glib::ControlFlow::Continue,
+    // İlk güncelleme kısa prime sonrası, devamı ayarlı interval ile yapılır.
+    let mut update_state = Some((data, classic_update, bars_update, proc_update));
+    glib::timeout_add_local(GUI_FIRST_UPDATE_DELAY, move || {
+        let Some((data, classic_update, bars_update, proc_update)) = update_state.take() else {
+            return glib::ControlFlow::Break;
         };
-        classic_update(&target);
-        bars_update(&target);
-        proc_update(&target);
-        glib::ControlFlow::Continue
+
+        if let Ok(d) = data.lock() {
+            let target = d.clone();
+            classic_update(&target);
+            bars_update(&target);
+            proc_update(&target);
+        }
+
+        glib::timeout_add_local(interval, move || {
+            let target = match data.lock() {
+                Ok(d) => d.clone(),
+                Err(_) => return glib::ControlFlow::Continue,
+            };
+            classic_update(&target);
+            bars_update(&target);
+            proc_update(&target);
+            glib::ControlFlow::Continue
+        });
+
+        glib::ControlFlow::Break
     });
 }
 

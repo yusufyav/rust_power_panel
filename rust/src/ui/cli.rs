@@ -4,6 +4,8 @@ use crate::types::{usage_percent, CombinedProc, GpuData, GpuKind, GpuPowerTracke
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
+const SENSOR_PRIME_DELAY: Duration = Duration::from_millis(250);
+
 pub(super) fn cli_row(plain: &str, colored: &str, w: usize) -> String {
     let pad = w.saturating_sub(plain.chars().count());
     format!(
@@ -286,6 +288,9 @@ pub(crate) fn run_cli_mode(interval: Duration) {
         if let Some(p) = cpu_tracker.path {
             cpu_tracker.last_energy = read_u64(p).unwrap_or(0);
         }
+        sys.refresh_cpu_usage();
+        cpu_tracker.last_time = Instant::now();
+        tokio::time::sleep(SENSOR_PRIME_DELAY).await;
 
         let cpu_temp_path = detect_cpu_temp_path();
 
