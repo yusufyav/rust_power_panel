@@ -64,6 +64,19 @@ power_panel --version    # Show version
 power_panel --help       # Show help
 ```
 
+## Tab Tamamlama (bash)
+
+Repo kökünden:
+
+```bash
+# Geçici (oturum için)
+source /yol/completions/power_panel.bash
+
+# Kalıcı (kullanıcı)
+mkdir -p ~/.local/share/bash-completion/completions
+cp completions/power_panel.bash ~/.local/share/bash-completion/completions/power_panel
+```
+
 ## 🛠️ Makefile Targets
 
 | Target | Description |

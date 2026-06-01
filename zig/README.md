@@ -77,4 +77,17 @@ GTK4 dinamik linklendiği için GUI'li binary diske ek yük getirmez.
 ./zig-out/bin/power_panel --debug    # sensör erişim teşhisi
 ```
 
+## Tab Tamamlama (bash)
+
+Repo kökünden:
+
+```bash
+# Geçici (oturum için)
+source /yol/completions/power_panel.bash
+
+# Kalıcı (kullanıcı)
+mkdir -p ~/.local/share/bash-completion/completions
+cp completions/power_panel.bash ~/.local/share/bash-completion/completions/power_panel
+```
+
 RAPL/hwmon erişimi için ana projedeki `make permissions` (udev kuralı) geçerli.
