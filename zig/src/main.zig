@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         return;
     }
 
-    // Argümansız: Rust varsayılanı build_ui → gui1 (etiketli panel) başlat.
+    // Argümansız: Varsayılan GUI teması Bars.
     gui.run1(parsed.interval_ms);
 }
 

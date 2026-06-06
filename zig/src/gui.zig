@@ -40,6 +40,7 @@ const ICON_CPU = "\u{f4bc}";
 const ICON_GPU = "\u{f08ae}";
 const ICON_RAM = "\u{f035b}";
 const ICON_VRAM = "\u{f048b}";
+const ICON_ZIG = "\u{e6a9}";
 
 // ── extern GTK / GLib / cairo ─────────────────────────────────────────────────
 extern fn gtk_application_new(app_id: [*:0]const u8, flags: c_uint) Obj;
@@ -143,8 +144,10 @@ const PANEL_CSS =
     \\.panel .lbl-ram { color: #00cec9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; font-weight: bold; }
     \\.panel .val-vram { color: #74b9ff; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; }
     \\.panel .val-pct { color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 16px; }
+    \\.panel .hw-icon { font-size: 22px; font-weight: bold; }
     \\
     \\.panel2 .brand-lbl { color: #a0a8b0; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 13px; }
+    \\.panel2 .brand-icon { color: #a0a8b0; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 24px; font-weight: bold; }
     \\.panel2 .total-watt { color: #00ffcc; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 22px; font-weight: bold; }
     \\.panel2 .lbl-cpu { color: #ff9f43; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; font-weight: bold; }
     \\.panel2 .lbl-gpu { color: #2ecc71; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace; font-size: 14px; font-weight: bold; }
@@ -561,13 +564,19 @@ fn buildBarsContent() Obj {
     gtk_widget_add_css_class(panel, "panel2");
 
     const title_row = gtk_box_new(ORIENTATION_HORIZONTAL, 0);
+    const brand_box = gtk_box_new(ORIENTATION_HORIZONTAL, 5);
+    gtk_widget_set_hexpand(brand_box, 1);
+    gtk_widget_set_valign(brand_box, ALIGN_END);
     const brand = label("PowerPanel", "brand-lbl");
-    gtk_widget_set_hexpand(brand, 1);
     gtk_label_set_xalign(brand, 0.0);
     gtk_widget_set_valign(brand, ALIGN_END);
+    const brand_icon = label(ICON_ZIG, "brand-icon");
+    gtk_widget_set_valign(brand_icon, ALIGN_END);
+    gtk_box_append(brand_box, brand);
+    gtk_box_append(brand_box, brand_icon);
     ctx2.total_label = label("⚡  0.0 W", "total-watt");
     gtk_label_set_xalign(ctx2.total_label, 1.0);
-    gtk_box_append(title_row, brand);
+    gtk_box_append(title_row, brand_box);
     gtk_box_append(title_row, ctx2.total_label);
     gtk_box_append(panel, title_row);
 
@@ -811,6 +820,7 @@ fn makeHwRow(icon: [*:0]const u8, name: [*:0]const u8, cls: [*:0]const u8, watt_
     const row = gtk_box_new(ORIENTATION_HORIZONTAL, 0);
 
     const lbl_icon = label(icon, cls);
+    gtk_widget_add_css_class(lbl_icon, "hw-icon");
     gtk_label_set_width_chars(lbl_icon, 3);
     gtk_label_set_xalign(lbl_icon, 0.0);
 
@@ -826,7 +836,7 @@ fn makeHwRow(icon: [*:0]const u8, name: [*:0]const u8, cls: [*:0]const u8, watt_
     gtk_label_set_width_chars(lbl_therm, 3);
     gtk_label_set_xalign(lbl_therm, 1.0);
 
-    const lbl_temp = label("  0°C", "val-temp-cool");
+    const lbl_temp = label(" 0°C ", "val-temp-cool");
     gtk_label_set_width_chars(lbl_temp, 5);
     gtk_label_set_xalign(lbl_temp, 1.0);
 
@@ -851,6 +861,7 @@ fn makeHwRow(icon: [*:0]const u8, name: [*:0]const u8, cls: [*:0]const u8, watt_
 fn makeRamRow(ram_out: *Obj, pct_out: *Obj) Obj {
     const row = gtk_box_new(ORIENTATION_HORIZONTAL, 0);
     const lbl_icon = label(ICON_RAM, "lbl-ram");
+    gtk_widget_add_css_class(lbl_icon, "hw-icon");
     gtk_label_set_width_chars(lbl_icon, 3);
     gtk_label_set_xalign(lbl_icon, 0.0);
     const lbl_name = label("RAM", "lbl-ram");
@@ -874,6 +885,7 @@ fn makeRamRow(ram_out: *Obj, pct_out: *Obj) Obj {
 fn makeVramRow(vram_out: *Obj, pct_out: *Obj) Obj {
     const row = gtk_box_new(ORIENTATION_HORIZONTAL, 0);
     const lbl_icon = label(ICON_VRAM, "lbl-gpu");
+    gtk_widget_add_css_class(lbl_icon, "hw-icon");
     gtk_label_set_width_chars(lbl_icon, 3);
     gtk_label_set_xalign(lbl_icon, 0.0);
     const lbl_name = label("VRAM", "lbl-gpu");
@@ -927,7 +939,7 @@ fn updateUi1(snap: *const sensors.Snapshot) void {
     setClasses(ctx1.cpu_therm, cpu_cls);
     setClasses(ctx1.cpu_temp, cpu_cls);
     b.len = 0;
-    b.print("{d:>3}°C", .{floorTemp(snap.cpu_temp)});
+    b.print("{d:>2}°C ", .{floorTemp(snap.cpu_temp)});
     gtk_label_set_text(ctx1.cpu_temp, b.z());
     setClasses(ctx1.cpu_pct, usageClass(snap.cpu_percent));
     b.len = 0;
@@ -942,7 +954,7 @@ fn updateUi1(snap: *const sensors.Snapshot) void {
     setClasses(ctx1.gpu_therm, gpu_cls);
     setClasses(ctx1.gpu_temp, gpu_cls);
     b.len = 0;
-    b.print("{d:>3}°C", .{floorTemp(gpu.temp)});
+    b.print("{d:>2}°C ", .{floorTemp(gpu.temp)});
     gtk_label_set_text(ctx1.gpu_temp, b.z());
     const has_pct = gpuHasPct(gpu.kind);
     setClasses(ctx1.gpu_pct, if (has_pct) usageClass(gpu.gfx_percent) else "val-pct");
@@ -982,5 +994,5 @@ fn updateUi1(snap: *const sensors.Snapshot) void {
 }
 
 pub fn run1(interval_ms: u32) void {
-    runSwitchable(.classic, interval_ms);
+    runSwitchable(.bars, interval_ms);
 }

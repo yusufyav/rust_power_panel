@@ -7,6 +7,8 @@ use gtk4::{Box as GtkBox, Label, Orientation};
 use std::cell::Cell;
 use std::rc::Rc;
 
+const BRAND_ICON: &str = "\u{e7a8}";
+
 // ── Bars içeriği yardımcıları ────────────────────────────────────────────────
 
 fn draw_bar_fn(cr: &gtk4::cairo::Context, width: i32, height: i32, pct: u32) {
@@ -81,19 +83,28 @@ pub(super) fn build_bars_content() -> Content {
 
     // Title row: brand left, total watts right
     let title_row = GtkBox::new(Orientation::Horizontal, 0);
+    let brand_box = GtkBox::new(Orientation::Horizontal, 5);
+    brand_box.set_hexpand(true);
+    brand_box.set_valign(gtk4::Align::End);
     let brand_lbl = Label::builder()
         .label("PowerPanel")
         .css_classes(vec!["brand-lbl".to_string()])
-        .hexpand(true)
         .xalign(0.0)
         .valign(gtk4::Align::End)
         .build();
+    let brand_icon = Label::builder()
+        .label(BRAND_ICON)
+        .css_classes(vec!["brand-icon".to_string()])
+        .valign(gtk4::Align::End)
+        .build();
+    brand_box.append(&brand_lbl);
+    brand_box.append(&brand_icon);
     let total_label = Label::builder()
         .label("⚡  0.0 W")
         .css_classes(vec!["total-watt".to_string()])
         .xalign(1.0)
         .build();
-    title_row.append(&brand_lbl);
+    title_row.append(&brand_box);
     title_row.append(&total_label);
     panel.append(&title_row);
 

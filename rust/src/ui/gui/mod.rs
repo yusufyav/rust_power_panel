@@ -152,7 +152,7 @@ fn build_switchable_ui(app: &Application, initial: GuiStyle, interval: Duration)
 
 pub(crate) fn run_gui(interval: Duration, args: &[String]) -> glib::ExitCode {
     let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(move |app| build_switchable_ui(app, GuiStyle::Classic, interval));
+    app.connect_activate(move |app| build_switchable_ui(app, GuiStyle::Bars, interval));
     let argv0 = args.first().map(String::as_str).unwrap_or("power_panel");
     app.run_with_args(&[argv0])
 }

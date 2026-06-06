@@ -37,7 +37,7 @@ pub(super) fn build_classic_content() -> Content {
         let cpu_cls = temp_css_class(target.cpu_temp);
         cpu_therm_lbl.set_css_classes(&[cpu_cls]);
         cpu_temp_lbl.set_css_classes(&[cpu_cls]);
-        cpu_temp_lbl.set_text(&format!("{:>3.0}°C", target.cpu_temp.floor()));
+        cpu_temp_lbl.set_text(&format!("{:>2.0}°C ", target.cpu_temp.floor()));
         cpu_pct_lbl.set_css_classes(&[usage_css_class(target.cpu_percent)]);
         cpu_pct_lbl.set_text(&format!("●{:>3}%", target.cpu_percent));
 
@@ -45,7 +45,7 @@ pub(super) fn build_classic_content() -> Content {
         let gpu_cls = temp_css_class(target.gpu_temp);
         gpu_therm_lbl.set_css_classes(&[gpu_cls]);
         gpu_temp_lbl.set_css_classes(&[gpu_cls]);
-        gpu_temp_lbl.set_text(&format!("{:>3.0}°C", target.gpu_temp.floor()));
+        gpu_temp_lbl.set_text(&format!("{:>2.0}°C ", target.gpu_temp.floor()));
         let gpu_has_pct = matches!(target.gpu_kind, GpuKind::Nvidia | GpuKind::Amd);
         let gpu_pct_text = if gpu_has_pct {
             format!("●{:>3}%", target.gpu_gfx_percent)
@@ -92,7 +92,7 @@ fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label, Labe
     let row = GtkBox::new(Orientation::Horizontal, 0);
     let lbl_icon = Label::builder()
         .label(icon)
-        .css_classes(vec![cls.to_string()])
+        .css_classes(vec![cls.to_string(), "hw-icon".to_string()])
         .width_chars(3)
         .xalign(0.0)
         .build();
@@ -115,7 +115,7 @@ fn make_hw_row(icon: &str, name: &str, cls: &str) -> (GtkBox, Label, Label, Labe
         .xalign(1.0)
         .build();
     let lbl_temp = Label::builder()
-        .label("  0°C")
+        .label(" 0°C ")
         .css_classes(vec!["val-temp-cool".to_string()])
         .width_chars(5)
         .xalign(1.0)
@@ -139,7 +139,7 @@ fn make_vram_row() -> (GtkBox, Label, Label) {
     let row = GtkBox::new(Orientation::Horizontal, 0);
     let lbl_icon = Label::builder()
         .label("\u{f048b}")
-        .css_classes(vec!["lbl-gpu".to_string()])
+        .css_classes(vec!["lbl-gpu".to_string(), "hw-icon".to_string()])
         .width_chars(3)
         .xalign(0.0)
         .build();
@@ -172,7 +172,7 @@ fn make_ram_row() -> (GtkBox, Label, Label) {
     let row = GtkBox::new(Orientation::Horizontal, 0);
     let lbl_icon = Label::builder()
         .label("\u{f035b}")
-        .css_classes(vec!["lbl-ram".to_string()])
+        .css_classes(vec!["lbl-ram".to_string(), "hw-icon".to_string()])
         .width_chars(3)
         .xalign(0.0)
         .build();

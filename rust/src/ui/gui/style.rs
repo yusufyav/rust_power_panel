@@ -125,11 +125,18 @@ pub(super) const PANEL_CSS: &str = "
         color: #dfe6e9; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
         font-size: 16px;
     }
+    .panel .hw-icon {
+        font-size: 22px; font-weight: bold;
+    }
 
     /* ── Bars (.panel2) ── */
     .panel2 .brand-lbl {
         color: #a0a8b0; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
         font-size: 13px;
+    }
+    .panel2 .brand-icon {
+        color: #a0a8b0; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
+        font-size: 24px; font-weight: bold;
     }
     .panel2 .total-watt {
         color: #00ffcc; font-family: 'JetBrainsMono Nerd Font', 'JetBrains Mono', monospace;
